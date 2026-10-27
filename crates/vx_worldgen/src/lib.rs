@@ -5,6 +5,7 @@
 //! grass and sand assigned by height, depth and slope. The planet atlas arrives in M3.
 
 mod sampler;
+mod seed;
 mod textures;
 
 pub use sampler::TerrainSampler;
