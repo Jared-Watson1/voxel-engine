@@ -1,0 +1,30 @@
+[package]
+name = "vx_game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+profile = ["dep:puffin", "dep:puffin_http", "profiling/profile-with-puffin"]
+
+[dependencies]
+anyhow.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+glam.workspace = true
+png.workspace = true
+profiling.workspace = true
+puffin = { workspace = true, optional = true }
+puffin_http = { workspace = true, optional = true }
+ron.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vx_core.workspace = true
+vx_render.workspace = true
+vx_voxel.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

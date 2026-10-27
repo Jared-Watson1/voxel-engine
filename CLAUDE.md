@@ -1,0 +1,116 @@
+# Voxel Engine
+
+Guidance for Claude Code and any other agent working in this repository.
+
+## What this is
+
+Voxel Engine is a from scratch voxel game engine for procedurally generated planetary systems. Planets are made of editable smooth voxels (a signed distance field with materials) generated from plate tectonics, erosion, drainage and climate; the player walks on the surface, boards a spaceship, flies through the atmosphere into orbit and across a solar system of orbiting planets and moons with no loading screens; physics is believable; everything is reproducible from a seed. It is a solo passion project built piecewise in milestones, with performance on mid range hardware (Apple M1 as the baseline) treated as a feature.
+
+## Where the thinking lives
+
+Design, research, decisions and the roadmap live in the Obsidian vault at `~/Documents/projects/Voxel Engine/`, not in this repo. Before planning any non trivial work read, in order: `Voxel Engine/CLAUDE.md`, `Voxel Engine/Voxel Engine — Project Hub.md` (open threads), then the notes the task needs, usually the design document (`Product/Voxel Engine Design Document — Vision, Scope and Architecture.md`), the roadmap (`Product/Voxel Engine Roadmap — Milestones and Vertical Slices.md`) and the decision log (`Product/Voxel Engine Decision Log — Stack, Voxels, Frames and Generation.md`). Work orders for this repo are in `Voxel Engine/Plans/`. When a milestone step is done, tick it in the roadmap and update the relevant note's `status:` line the same day. Never open `Credentials.md` or any key file in the vault.
+
+Decisions are numbered (D1, D2, ...). Code comments and commit messages that depend on one cite the number. A change that contradicts a decision does not happen until the decision log has a superseding entry.
+
+## Status
+
+M0 (scaffold) done 2026-10-27: workspace with the eight crates, winit window and wgpu device on Metal, f64 fly camera rendered camera relative with reverse-Z Depth32Float, one 32^3 chunk meshed with Transvoxel regular cells from an analytic sphere, egui overlay, puffin spans, WGSL and config hot reload. Measured at the 1.0 m default, 1920x1080, Apple M1: 60.0 fps with vsync (16.68 ms mean), 308 fps uncapped (3.25 ms mean, 1.99 ms median), 1304 triangles. Numbers, deviations and the screenshot are recorded in the roadmap's M0 section and in `Voxel Engine/Plans/2026-10-26-m0-scaffold.md`. M1 (editable terrain slab) is next and has no work order yet. Update this paragraph when the state changes.
+
+## Stack (D1, accepted 2026-10-26)
+
+- Rust, stable toolchain (1.96 at the time of writing), edition 2024, cargo workspace. No nightly features.
+- wgpu for graphics and compute (30.0.1 as of 2026-10-26; breaking majors ship about quarterly, upgrade only at milestone boundaries), WGSL shaders. Metal on macOS, Vulkan or DX12 on Windows, Vulkan on Linux. The renderer uses only features available on all three: compute, storage buffers, single indirect draws with vertex pulling, binding arrays for textures, subgroups, timestamp queries. No dependency on mesh shaders, ray tracing, multi draw indirect with count buffers (Metal emulates multi draw as a CPU loop) or f64 in shaders (Metal has none).
+- winit 0.30.x for windowing and input (0.31 is beta; egui-wgpu 0.37 pins 0.30), egui 0.37 (egui-wgpu, egui-winit) for debug UI and tools, glam 0.34 for math (f64 types for world positions, f32 SIMD types for rendering), rayon or a custom work stealing pool for jobs, a frame profiler from the first commit (puffin through the `profiling` crate, chosen in M0 because tracy-client compiles C++; wgpu-profiler for GPU scopes later, Apple GPUs give no timestamps inside passes), tracing for logs, serde for data files.
+- Physics: leaning `rapier3d` (pure Rust, has a voxel collider); `oxijolt` (Jolt bindings, needs CMake on macOS) is the fallback. Decided for good before M5 (D7). Orbital mechanics are hand written in `vx_universe`, never in the physics library (D6).
+- Noise and generation are pure Rust and CPU authoritative (the world must be bit identical on every machine). The `fastnoise2` bindings are optional and need CMake or a prebuilt library. GPU noise in WGSL only for far field preview geometry outside the blend band.
+- No game engine crates (Bevy, Fyrox) and no Godot or Unity. Those are the thing being built.
+- Record every dependency's version and the reason it was added in the "Dependencies" section below when it lands.
+
+## Dependencies
+
+Versions are the latest stable on crates.io when added (2026-10-26). All pure Rust on macOS: `cargo tree -i cc` is empty.
+
+| Crate | Version | License | Used by | Why | Added |
+|---|---|---|---|---|---|
+| wgpu | 30.0.1 | MIT OR Apache-2.0 | vx_render | graphics and compute on Metal, Vulkan, DX12 (D1) | M0 |
+| winit | 0.30.13 | Apache-2.0 | vx_render, vx_game | window and input; 0.30 because egui-winit 0.37 pins it (D1) | M0 |
+| egui, egui-wgpu, egui-winit | 0.37.0 | MIT OR Apache-2.0 | vx_render, vx_game | debug overlay; egui with `default_fonts` (D1) | M0 |
+| glam | 0.34.1 | MIT OR Apache-2.0 | vx_core, vx_voxel, vx_render, vx_game | f64 world math and f32 render math (D1, D4) | M0 |
+| bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | vx_render | `Pod` uniform and vertex structs (engineering rule 9) | M0 |
+| pollster | 1.0.1 | Apache-2.0 OR MIT | vx_render | resolves adapter, device and error scope futures on native | M0 |
+| anyhow | 1.0.104 | MIT OR Apache-2.0 | vx_game | errors in the binary | M0 |
+| thiserror | 2.0.21 | MIT OR Apache-2.0 | vx_core, vx_render | errors in library crates | M0 |
+| tracing, tracing-subscriber | 0.1.44, 0.3.23 | MIT | vx_render, vx_game | logs | M0 |
+| profiling | 1.0.18 | MIT OR Apache-2.0 | vx_voxel, vx_render, vx_game | profiler scopes, zero cost without the `profile` feature | M0 |
+| puffin, puffin_http | 0.20.0, 0.17.0 | MIT OR Apache-2.0 | vx_game (`profile` feature) | profiler backend and server; tracy-client was not used because it compiles C++ | M0 |
+| notify | 8.2.1 | CC0-1.0 | vx_core | file watching for shader and config hot reload (9.0 is a release candidate) | M0 |
+| serde, ron | 1.0.229, 0.12.2 | MIT OR Apache-2.0 | vx_core, vx_game | `WorldConfig` and scene config files (D11) | M0 |
+| transvoxel | 2.0.0 | MIT OR Apache-2.0 | vx_voxel | Transvoxel regular cells now, transition cells in M2 (D2); pulls `transvoxel-data` 0.2.1 (MIT on crates.io; the vault still lists the license of Lengyel's original tables as unverified), `num` 0.4 and `flagset` 0.4 (Apache-2.0) | M0 |
+| png | 0.18.1 | MIT OR Apache-2.0 | vx_game | screenshot encoding on a worker thread | M0 |
+
+## Crate layout
+
+```
+Cargo.toml                workspace
+crates/vx_core         f64/f32 math and frames, ids, time, job system and pipelines, allocators, config
+crates/vx_voxel        chunk storage and compression, SDF ops and brushes, octree clipmap and LOD, Transvoxel meshing, edit deltas, serialization
+crates/vx_worldgen     planet parameters, planet atlas (plates, uplift, erosion, drainage, climate, biomes), noise stack, SDF sampler, materials
+crates/vx_universe     star system model, Keplerian propagation, spheres of influence, frames and rebasing, simulation time and warp
+crates/vx_render       wgpu device, frame graph, GPU driven terrain pass, far surface patches, atmosphere, ocean, shadows, post, debug draw, egui
+crates/vx_physics      rigid body integration, SDF terrain colliders, character controller, ship flight model, buoyancy
+crates/vx_game         the binary: window, input, app loop, player and ship states, camera, HUD, settings
+crates/vx_tools        planet atlas viewer, chunk inspector, headless benchmarks
+assets/                   shaders (WGSL), config (RON), CC0 textures, data tables; no hand authored meshes
+```
+
+M0 state: `vx_core` (frames, `camera_relative`, reverse-Z `Projection`, `FixedStep`, `WorldConfig`, `FileWatcher`), `vx_voxel` (dense `Chunk` with a (CHUNK_SIZE + 3)^3 apron, `mesh_regular`), `vx_render` (device, surface, terrain and egui passes, hot reload, frame capture) and `vx_game` (app loop, `FlyCamera`, overlay, automation flags) have code. `vx_worldgen`, `vx_universe`, `vx_physics` and `vx_tools` are empty stubs until their milestones.
+
+`vx` is short for Voxel Engine. Dependencies point downward only: `vx_game` depends on everything, `vx_core` on nothing in the workspace. `vx_render` never depends on `vx_worldgen` or `vx_physics`; it receives meshes and parameters.
+
+## Engineering rules
+
+These follow from the pillars in the design document. The pillar order (performance first, seamless scale, the world is data, believable not photoreal, piecewise and demoable) settles conflicts.
+
+1. **Positions are f64 in an explicit frame; the GPU sees camera relative f32 (D4).** No raw world position ever reaches a shader. Every frame conversion goes through `vx_core` frames. Reverse-Z with a float depth buffer and an infinite far plane; depth clears to 0 and the compare is Greater.
+2. **Generation is a pure function of (position, seed, planet atlas) (D5).** The same seed gives the same world on every machine and run. No randomness outside seeded generators; no reliance on iteration order of hash maps for anything that affects the world.
+3. **The main thread never blocks (D9).** No file I/O, generation, meshing or compression on the main thread. Every heavy task is a job with a measured duration; every pipeline stage reports its queue length to the debug UI.
+4. **Budgets are code.** Frame time, resident voxel memory, GPU pool size and per frame upload bytes are constants with names, checked at runtime in debug builds and shown in the egui overlay. The targets are in the design document and are revised only with measurements.
+5. **Measure before optimising, and keep the measurement.** Profiler spans on every stage. A headless benchmark (`cargo bench` or a `vx_tools` subcommand) for chunk generate and mesh; regressions are numbers, not feelings.
+6. **Seams are bugs.** Cracks between LOD levels, visible transitions between the voxel shell and the far surface, pops at frame switches and jitter at distance are fixed before new features land.
+7. **Data oriented layout.** Chunks, meshes and entities live in flat arrays and pools indexed by handles; no `Rc<RefCell<>>` graphs for hot data. `unsafe` only in `vx_core` allocators and GPU upload paths, with a comment stating the invariant.
+8. **Determinism in simulation.** Fixed time step for physics and orbital integration; rendering interpolates. Time warp multiplies the step count, never the step size, except for bodies on rails which are analytic.
+9. **Shaders are code.** WGSL files live in `assets/shaders/`, hot reload in debug builds, compile errors log and keep the previous pipeline. Units in shaders are metres; every uniform struct has a matching `#[repr(C)]` Rust struct validated with `bytemuck`.
+10. **No art pipeline.** Materials are procedural or CC0 textures (Poly Haven, ambientCG) with their license noted in `assets/LICENSES.md`. No hand authored meshes.
+11. **Scale is a parameter with a design default (D11).** Voxel size, planet radius, LOD radii, atmosphere depth and every other world scale value is a named field in `WorldConfig` or `PlanetParams` with its default documented beside it (1 m voxels, a 10 km planet for M2, 600 km for generated worlds) and a supported range. `CHUNK_SIZE` (32) is the one compile time constant. Tests run at the defaults and at both ends of each range; performance numbers always state the parameter values they were measured at.
+
+## Coding conventions
+
+- `cargo fmt` and `cargo clippy --all-targets -- -D warnings` clean before every commit. `cargo test` green.
+- Comments only where they add information the code cannot: an invariant, a non obvious reason, a reference (paper, decision number, URL). No comments that restate the code. No pronouns in comments or docs (no "we", "I", "you"); describe the thing.
+- No emojis anywhere, including commit messages and UI strings. Avoid dashes inside sentences in docs and comments; use a period, comma, colon or parentheses.
+- Names: `snake_case` for modules and functions, types in `CamelCase`, SI units in names where the unit is not obvious (`radius_m`, `dt_s`, `altitude_km`). Frames in type names where it matters (`BodyFixedPos`, `SystemPos`).
+- Errors: `thiserror` in library crates, `anyhow` in the binary. No `unwrap()` outside tests and the first lines of `main` except on invariants that are documented as such.
+- Public API of every crate is small and documented with `///`; internal modules are `pub(crate)`.
+- Tests next to the code (`#[cfg(test)]`), integration tests in `tests/` for cross crate behaviour (frames, pipeline), property style tests for SDF and meshing invariants (closed meshes, outward normals, no NaN).
+- Commit messages: a short imperative subject naming the milestone or system (`M0: reverse-Z projection and camera relative frame`), a body that says why, and the decision numbers touched.
+
+## Commands
+
+```
+cargo run --release -p vx_game                                  run the engine
+cargo run --release -p vx_game --features profile               with the puffin server on 127.0.0.1:8585 (view with puffin_viewer)
+cargo run --release -p vx_game -- --bench-seconds 30            measure frame times after warm up, print a BENCH line, exit
+cargo run --release -p vx_game -- --no-vsync --voxel-size 0.5   uncapped, with a one run voxel size override
+cargo run --release -p vx_game -- --screenshot out.png          save a PNG after warm up and exit
+cargo test --workspace                                          tests
+cargo clippy --all-targets -- -D warnings                       lints (also run with --features vx_game/profile)
+```
+
+Automated runs (`--bench-seconds`, `--screenshot`) ignore keyboard and mouse input so the camera stays where it was placed. Performance numbers state the voxel size, resolution and present mode they were measured at; the BENCH line includes all three. `cargo bench -p vx_voxel` arrives with the M1 headless benchmark.
+
+## Working here
+
+- Work in milestones from the roadmap. Do not start a later milestone's feature to unblock a current one; write the thread into the hub's open threads instead.
+- Each session that changes code ends with: tests and clippy green, the roadmap checkboxes updated, the vault note's `status:` updated, this file's Status section updated if the state changed.
+- Prefer the vault for anything a future session needs to know and the code for anything the compiler can check. Do not duplicate the design document here; link to it.
+- Ask before adding a dependency over roughly 50k lines or any dependency that pulls a C or C++ build (except the physics library chosen in D7); record it in the Dependencies section with its license.

@@ -1,0 +1,6 @@
+// World scale parameters (D11). Values here are the design defaults the performance budgets are
+// measured at; see WorldConfig in crates/vx_core/src/config.rs for each supported range.
+(
+    // Edge length of one voxel in metres. Design default 1.0, supported 0.25 to 4.0.
+    voxel_size_m: 1.0,
+)

@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/vx_core",
+    "crates/vx_voxel",
+    "crates/vx_worldgen",
+    "crates/vx_universe",
+    "crates/vx_render",
+    "crates/vx_physics",
+    "crates/vx_tools",
+    "crates/vx_game",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[workspace.dependencies]
+vx_core = { path = "crates/vx_core" }
+vx_voxel = { path = "crates/vx_voxel" }
+vx_worldgen = { path = "crates/vx_worldgen" }
+vx_universe = { path = "crates/vx_universe" }
+vx_render = { path = "crates/vx_render" }
+vx_physics = { path = "crates/vx_physics" }
+
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-wgpu = "0.37.0"
+egui-winit = "0.37.0"
+glam = { version = "0.34.1", features = ["bytemuck", "serde"] }
+notify = "8.2.1"
+png = "0.18.1"
+pollster = "1.0.1"
+profiling = "1.0.18"
+puffin = "0.20.0"
+puffin_http = "0.17.0"
+ron = "0.12.2"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+transvoxel = "2.0.0"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+debug = 1
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2

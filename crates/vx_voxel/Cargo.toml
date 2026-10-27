@@ -1,0 +1,15 @@
+[package]
+name = "vx_voxel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+glam.workspace = true
+profiling.workspace = true
+transvoxel.workspace = true
+vx_core.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+// M0 test scene: one chunk holding an analytic signed distance sphere centred in it.
+(
+    // Sphere radius in metres. Default 6.0 fits inside one chunk at voxel sizes of 0.5 m and up.
+    sphere_radius_m: 6.0,
+)
