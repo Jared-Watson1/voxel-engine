@@ -9,6 +9,9 @@
 //! and one indexed indirect draw renders them with vertex pulling and triplanar materials.
 
 mod capture;
+mod cull;
+mod materials;
+mod pool;
 mod terrain;
 
 use std::sync::Arc;
@@ -137,6 +140,10 @@ pub enum RenderError {
     Device(#[from] wgpu::RequestDeviceError),
     #[error("the surface is not supported by the adapter")]
     UnsupportedSurface,
+    #[error("terrain pools need {requested} bytes, over the {budget} byte GPU terrain budget")]
+    PoolBudget { requested: usize, budget: usize },
+    #[error("terrain pools need a {needed} byte storage binding, the adapter allows {supported}")]
+    PoolBindingTooLarge { needed: u64, supported: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +229,12 @@ pub struct Renderer {
 impl Renderer {
     /// Creates the device and surface. Blocks on adapter and device requests once at startup.
     pub fn new(window: Arc<Window>, settings: RenderSettings) -> Result<Self, RenderError> {
+        if settings.pools.gpu_bytes() > Budgets::GPU_TERRAIN_BYTES {
+            return Err(RenderError::PoolBudget {
+                requested: settings.pools.gpu_bytes(),
+                budget: Budgets::GPU_TERRAIN_BYTES,
+            });
+        }
         let size = window.inner_size();
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -231,11 +244,31 @@ impl Renderer {
             compatible_surface: Some(&surface),
             ..Default::default()
         }))?;
+        // Each pool is one storage binding; the WebGPU default binding limit (128 MiB) is below
+        // the default vertex pool, so the limit is raised to the pool size when the adapter can.
+        let pool_bytes = settings.pools.vertex_bytes.max(settings.pools.index_bytes) as u64;
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_storage_buffer_binding_size = required_limits
+            .max_storage_buffer_binding_size
+            .max(pool_bytes);
+        required_limits.max_buffer_size = required_limits.max_buffer_size.max(pool_bytes);
+        if required_limits.max_storage_buffer_binding_size
+            > adapter_limits.max_storage_buffer_binding_size
+            || required_limits.max_buffer_size > adapter_limits.max_buffer_size
+        {
+            return Err(RenderError::PoolBindingTooLarge {
+                needed: pool_bytes,
+                supported: adapter_limits
+                    .max_storage_buffer_binding_size
+                    .min(adapter_limits.max_buffer_size),
+            });
+        }
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("vx device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
                 ..Default::default()
             }))?;
         // Validation errors outside an error scope are logged rather than aborting, so a bad
@@ -301,7 +334,7 @@ impl Renderer {
         );
 
         let depth_view = create_depth_view(&device, config.width, config.height);
-        let terrain = terrain::TerrainPass::new(&device, scene_format);
+        let terrain = terrain::TerrainPass::new(&device, &queue, scene_format, settings.pools);
         let egui = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let capture = capture::Capture::new(usage.contains(wgpu::TextureUsages::COPY_SRC));
 
@@ -338,9 +371,12 @@ impl Renderer {
         self.depth_view = create_depth_view(&self.device, width, height);
     }
 
-    /// Replaces the terrain mesh. An empty mesh clears it. M0 path, removed by workstream E.
+    /// Replaces the M0 terrain mesh. An empty mesh clears it. Compatibility path: the mesh is
+    /// packed at the next frame's `voxel_size_m`, uploaded into the pools like any chunk and drawn
+    /// at [`FrameInput::mesh_offset_m`] with material 1. Removed when the game calls
+    /// [`Renderer::upload_mesh`] directly.
     pub fn set_mesh(&mut self, mesh: &MeshData) {
-        self.terrain.set_mesh(&self.device, mesh);
+        self.terrain.set_mesh(mesh);
     }
 
     /// Copies a packed mesh into the pools and returns its chunk slot. The slot is written into
@@ -351,36 +387,53 @@ impl Renderer {
         vertices: &[PackedVertex],
         indices: &[u32],
     ) -> Result<MeshHandle, PoolError> {
-        let _ = (vertices, indices);
-        todo!("workstream E")
+        self.terrain.upload_mesh(&self.queue, vertices, indices)
     }
 
     /// Releases the mesh's pool ranges and slot. Safe to call in the same frame as a draw that
-    /// listed the handle; the renderer drops it from that frame's chunk table.
+    /// listed the handle; the renderer drops it from that frame's chunk table. The slot may be
+    /// handed to the next upload, so a stale handle listed after that draws the new mesh.
     pub fn free_mesh(&mut self, handle: MeshHandle) {
-        let _ = handle;
-        todo!("workstream E")
+        self.terrain.free_mesh(handle);
     }
 
-    /// Uploads the material texture array. Until called, a built in debug pattern is used.
+    /// Uploads the material texture array with a CPU generated mip chain. Until called, a built
+    /// in debug pattern is used (magenta for layer 0, then grey, brown, green, yellow). A
+    /// malformed set is logged and the previous array stays bound.
     pub fn set_material_textures(&mut self, textures: &MaterialTextures) {
-        let _ = textures;
-        todo!("workstream E")
+        self.terrain
+            .set_material_textures(&self.device, &self.queue, textures);
+        let stats = self.terrain.pool_stats();
+        if stats.gpu_bytes() > Budgets::GPU_TERRAIN_BYTES {
+            tracing::warn!(
+                "GPU terrain memory {} bytes exceeds the {} byte budget after the material upload",
+                stats.gpu_bytes(),
+                Budgets::GPU_TERRAIN_BYTES
+            );
+        }
     }
 
     pub fn pool_stats(&self) -> PoolStats {
-        todo!("workstream E")
+        self.terrain.pool_stats()
     }
 
     /// Latest culling results, read back without blocking; `None` until the first readback.
+    /// Readbacks are polled at the start of [`Renderer::render`], so the values describe a frame
+    /// one or two renders ago (`frames_old`).
     pub fn cull_stats(&self) -> Option<CullStats> {
-        todo!("workstream E")
+        self.terrain.cull_stats()
     }
 
-    /// Compiles new terrain shader source. On any error the previous pipeline stays in use and the
-    /// error is returned for logging (engineering rule 9).
+    /// Compiles new terrain shader source (`assets/shaders/terrain.wgsl`). On any error the
+    /// previous pipeline stays in use and the error is returned for logging (engineering rule 9).
     pub fn reload_terrain_shader(&mut self, source: &str) -> Result<(), String> {
         self.terrain.reload(&self.device, self.scene_format, source)
+    }
+
+    /// Compiles new culling shader source (`assets/shaders/terrain_cull.wgsl`) for both compute
+    /// entry points. On any error both previous pipelines stay in use.
+    pub fn reload_cull_shader(&mut self, source: &str) -> Result<(), String> {
+        self.terrain.reload_cull(&self.device, source)
     }
 
     /// Copies the next presented frame, egui included, for [`Renderer::poll_capture`].
@@ -461,21 +514,14 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        self.terrain.write_uniform(
-            &self.queue,
-            &FrameUniform::new(
-                frame.view_proj,
-                frame.mesh_offset_m,
-                frame.sun_dir,
-                frame.ambient,
-            ),
-        );
+        self.terrain.prepare_frame(&self.device, &self.queue, frame);
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        self.terrain.encode_cull(&mut encoder);
 
         {
             profiling::scope!("terrain pass");
@@ -509,6 +555,7 @@ impl Renderer {
             });
             self.terrain.draw(&mut pass);
         }
+        self.terrain.encode_readback(&mut encoder);
 
         let mut extra_buffers = Vec::new();
         if let Some(ui) = &frame.egui {
@@ -553,6 +600,7 @@ impl Renderer {
             self.queue
                 .submit(extra_buffers.into_iter().chain([encoder.finish()]));
             self.capture.after_submit();
+            self.terrain.after_submit();
             self.queue.present(surface_texture);
         }
 
