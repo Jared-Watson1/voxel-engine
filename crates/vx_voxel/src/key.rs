@@ -70,7 +70,134 @@ impl ChunkKey {
     /// Every chunk whose stored block intersects the inclusive world sample box `min` to `max`.
     /// A brush's dirty set is this box for its padded bounds.
     pub fn chunks_intersecting_samples(min: IVec3, max: IVec3) -> Vec<Self> {
-        let _ = (min, max);
-        todo!("workstream B")
+        debug_assert!(
+            min.cmple(max).all(),
+            "sample box min {min} exceeds max {max}"
+        );
+        let (x0, x1) = Self::chunk_range_along_axis(min.x, max.x);
+        let (y0, y1) = Self::chunk_range_along_axis(min.y, max.y);
+        let (z0, z1) = Self::chunk_range_along_axis(min.z, max.z);
+        let count = |a: i32, b: i32| usize::try_from(i64::from(b) - i64::from(a) + 1).unwrap_or(0);
+        let mut keys = Vec::with_capacity(count(x0, x1) * count(y0, y1) * count(z0, z1));
+        for z in z0..=z1 {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    keys.push(Self::new(x, y, z));
+                }
+            }
+        }
+        keys
+    }
+
+    /// Inclusive range of chunk indices along one axis whose stored block (`32K - 1` to
+    /// `32K + 33`, D16) intersects the inclusive sample range `min` to `max`. Euclidean division
+    /// keeps the rounding direction correct for negative coordinates.
+    fn chunk_range_along_axis(min: i32, max: i32) -> (i32, i32) {
+        let size = CHUNK_SIZE as i32;
+        let apron_end = size + 1;
+        // ceil((min - apron_end) / size) and floor((max + 1) / size).
+        let first = (min - apron_end + size - 1).div_euclid(size);
+        let last = (max + 1).div_euclid(size);
+        (first, last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chunks along x holding `sample`; y and z sit deep inside chunk 0 so only x varies.
+    fn axis_chunks(sample: i32) -> Vec<i32> {
+        let mid = CHUNK_SIZE as i32 / 2;
+        let probe = IVec3::new(sample, mid, mid);
+        ChunkKey::chunks_intersecting_samples(probe, probe)
+            .into_iter()
+            .map(|k| k.x)
+            .collect()
+    }
+
+    #[test]
+    fn one_sample_lies_in_one_or_two_chunks_per_axis() {
+        // Worked examples from D16, along x, in positive and negative coordinates.
+        let cases: [(i32, &[i32]); 17] = [
+            (0, &[-1, 0]),
+            (1, &[-1, 0]),
+            (2, &[0]),
+            (30, &[0]),
+            (31, &[0, 1]),
+            (32, &[0, 1]),
+            (33, &[0, 1]),
+            (34, &[1]),
+            (-1, &[-1, 0]),
+            (-2, &[-1]),
+            (-30, &[-1]),
+            (-31, &[-2, -1]),
+            (-32, &[-2, -1]),
+            (-33, &[-2, -1]),
+            (-34, &[-2]),
+            (64, &[1, 2]),
+            (-64, &[-3, -2]),
+        ];
+        for (sample, expected) in cases {
+            assert_eq!(axis_chunks(sample), expected, "sample {sample}");
+        }
+    }
+
+    #[test]
+    fn every_chunk_returned_stores_the_sample_and_no_other_does() {
+        let size = CHUNK_SIZE as i32;
+        for sample in -100..100 {
+            let found = axis_chunks(sample);
+            for k in -5..5 {
+                let holds = (size * k - 1..=size * k + size + 1).contains(&sample);
+                assert_eq!(found.contains(&k), holds, "sample {sample} chunk {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn box_spanning_two_chunks_along_x_only() {
+        let keys =
+            ChunkKey::chunks_intersecting_samples(IVec3::new(20, 5, 5), IVec3::new(40, 10, 10));
+        assert_eq!(keys, vec![ChunkKey::new(0, 0, 0), ChunkKey::new(1, 0, 0)]);
+    }
+
+    #[test]
+    fn keys_come_out_x_fastest_then_y_then_z() {
+        let keys = ChunkKey::chunks_intersecting_samples(IVec3::splat(31), IVec3::splat(32));
+        assert_eq!(keys.len(), 8);
+        assert_eq!(keys[0], ChunkKey::new(0, 0, 0));
+        assert_eq!(keys[1], ChunkKey::new(1, 0, 0));
+        assert_eq!(keys[2], ChunkKey::new(0, 1, 0));
+        assert_eq!(keys[4], ChunkKey::new(0, 0, 1));
+        assert_eq!(keys[7], ChunkKey::new(1, 1, 1));
+        let mut sorted = keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "no duplicate keys");
+    }
+
+    #[test]
+    fn holding_sample_counts_one_two_four_or_eight() {
+        assert_eq!(
+            ChunkKey::chunks_holding_sample(IVec3::new(16, 16, 16)).len(),
+            1
+        );
+        assert_eq!(
+            ChunkKey::chunks_holding_sample(IVec3::new(0, 16, 16)).len(),
+            2
+        );
+        assert_eq!(
+            ChunkKey::chunks_holding_sample(IVec3::new(0, 0, 16)).len(),
+            4
+        );
+        assert_eq!(
+            ChunkKey::chunks_holding_sample(IVec3::new(0, 0, 0)).len(),
+            8
+        );
+        assert_eq!(
+            ChunkKey::chunks_holding_sample(IVec3::new(-32, 33, 1)).len(),
+            8
+        );
     }
 }
