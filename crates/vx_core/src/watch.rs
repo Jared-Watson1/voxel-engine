@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
@@ -7,6 +7,8 @@ use notify::{EventKind, RecursiveMode, Watcher};
 /// New contents of a watched file, read on the watcher's own thread.
 #[derive(Debug)]
 pub struct FileEvent {
+    /// The path exactly as passed to [`FileWatcher::new`], so callers compare without touching the
+    /// file system.
     pub path: PathBuf,
     pub contents: std::io::Result<String>,
 }
@@ -24,13 +26,13 @@ pub struct FileWatcher {
 
 impl FileWatcher {
     pub fn new(files: &[PathBuf]) -> notify::Result<Self> {
-        let files: HashSet<PathBuf> = files.iter().map(|f| canonical(f)).collect();
-        let dirs: HashSet<PathBuf> = files
-            .iter()
+        let watched: HashMap<PathBuf, PathBuf> =
+            files.iter().map(|f| (canonical(f), f.clone())).collect();
+        let dirs: HashSet<PathBuf> = watched
+            .keys()
             .filter_map(|f| f.parent().map(Path::to_path_buf))
             .collect();
         let (tx, rx) = channel();
-        let watched = files.clone();
         let mut watcher =
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let Ok(event) = res else { return };
@@ -38,11 +40,13 @@ impl FileWatcher {
                     return;
                 }
                 for path in event.paths {
-                    let path = canonical(&path);
-                    if watched.contains(&path) {
-                        let contents = std::fs::read_to_string(&path);
+                    if let Some(original) = watched.get(&canonical(&path)) {
+                        let contents = std::fs::read_to_string(original);
                         // A closed receiver means the app is shutting down.
-                        let _ = tx.send(FileEvent { path, contents });
+                        let _ = tx.send(FileEvent {
+                            path: original.clone(),
+                            contents,
+                        });
                     }
                 }
             })?;
@@ -63,11 +67,6 @@ impl FileWatcher {
             latest.push(event);
         }
         latest
-    }
-
-    /// True when `path` names the same file as a path this watcher reports.
-    pub fn is(event: &FileEvent, path: &Path) -> bool {
-        event.path == canonical(path)
     }
 }
 
@@ -96,14 +95,11 @@ mod tests {
             std::fs::write(&other, "noise").unwrap();
             std::fs::write(&file, "two").unwrap();
             std::thread::sleep(Duration::from_millis(100));
-            seen = watcher
-                .poll()
-                .into_iter()
-                .find(|e| FileWatcher::is(e, &file));
+            seen = watcher.poll().into_iter().find(|e| e.path == file);
         }
         let event = seen.expect("no event for the watched file");
         assert_eq!(event.contents.unwrap(), "two");
-        assert!(watcher.poll().iter().all(|e| !FileWatcher::is(e, &other)));
+        assert!(watcher.poll().iter().all(|e| e.path != other));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

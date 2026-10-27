@@ -328,14 +328,14 @@ impl Running {
         });
         let rendered = {
             profiling::scope!("render");
-            self.renderer.render(&FrameInput {
+            self.renderer.render(FrameInput {
                 view_proj: self.camera.view_proj(),
                 mesh_offset_m,
                 sun_dir: SUN_DIR.normalize(),
                 ambient: AMBIENT,
                 egui: Some(EguiFrame {
                     primitives: &primitives,
-                    textures_delta: &full_output.textures_delta,
+                    textures_delta: full_output.textures_delta,
                     pixels_per_point,
                 }),
             })
@@ -373,7 +373,7 @@ impl Running {
         let Some(watcher) = &self.watcher else { return };
         let mut regenerate = false;
         for event in watcher.poll() {
-            if FileWatcher::is(&event, &self.shader_path) {
+            if event.path == self.shader_path {
                 match event.contents {
                     Ok(source) => match self.renderer.reload_terrain_shader(&source) {
                         Ok(()) => {

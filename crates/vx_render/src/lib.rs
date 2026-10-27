@@ -49,7 +49,8 @@ pub struct MeshData<'a> {
 /// egui output for one frame, already tessellated.
 pub struct EguiFrame<'a> {
     pub primitives: &'a [egui::ClippedPrimitive],
-    pub textures_delta: &'a egui::TexturesDelta,
+    /// Consumed by [`Renderer::render`]; egui asserts in debug builds that every delta is applied.
+    pub textures_delta: egui::TexturesDelta,
     pub pixels_per_point: f32,
 }
 
@@ -96,6 +97,9 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     /// sRGB view format the 3D passes render through; egui draws through the surface's own format.
     scene_format: wgpu::TextureFormat,
+    /// Set when the last image was suboptimal; the surface cannot be reconfigured while an image
+    /// is held, so it happens before the next acquire.
+    reconfigure: bool,
     depth_view: wgpu::TextureView,
     terrain: terrain::TerrainPass,
     egui: egui_wgpu::Renderer,
@@ -195,6 +199,7 @@ impl Renderer {
             queue,
             config,
             scene_format,
+            reconfigure: false,
             depth_view,
             terrain,
             egui,
@@ -247,17 +252,20 @@ impl Renderer {
         self.capture.try_take(self.config.format)
     }
 
-    pub fn render(&mut self, frame: &FrameInput) -> FrameResult {
+    pub fn render(&mut self, mut frame: FrameInput) -> FrameResult {
         profiling::scope!("Renderer::render");
         // egui texture deltas arrive once; they must be applied and freed even when the surface
         // skips the frame, or later frames reference textures that were never uploaded.
-        if let Some(ui) = &frame.egui {
-            for (id, deltas) in &ui.textures_delta.set {
-                for delta in deltas {
+        if let Some(ui) = &mut frame.egui {
+            for (id, deltas) in ui.textures_delta.set.drain() {
+                for delta in &deltas {
                     self.egui
-                        .update_texture(&self.device, &self.queue, *id, delta);
+                        .update_texture(&self.device, &self.queue, id, delta);
                 }
             }
+        }
+        if std::mem::take(&mut self.reconfigure) {
+            self.surface.configure(&self.device, &self.config);
         }
         let acquire_start = std::time::Instant::now();
         let acquired = {
@@ -265,10 +273,10 @@ impl Renderer {
             self.surface.get_current_texture()
         };
         let acquire_ms = acquire_start.elapsed().as_secs_f64() * 1.0e3;
-        let status = self.draw(frame, acquired);
-        if let Some(ui) = &frame.egui {
-            for id in &ui.textures_delta.free {
-                self.egui.free_texture(id);
+        let status = self.draw(&frame, acquired);
+        if let Some(ui) = &mut frame.egui {
+            for id in ui.textures_delta.free.drain() {
+                self.egui.free_texture(&id);
             }
         }
         FrameResult { status, acquire_ms }
@@ -278,7 +286,7 @@ impl Renderer {
         let surface_texture = match acquired {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                self.surface.configure(&self.device, &self.config);
+                self.reconfigure = true;
                 t
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
