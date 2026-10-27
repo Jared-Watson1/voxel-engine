@@ -97,6 +97,16 @@ struct BrushSettings {
     radius_voxels: f64,
 }
 
+/// Main thread time of each part of the last frame, in milliseconds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FrameSections {
+    pub polls_ms: f64,
+    pub update_ms: f64,
+    pub egui_ms: f64,
+    pub draw_list_ms: f64,
+    pub render_ms: f64,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct BenchPeaks {
     cpu_ms_max: f64,
@@ -133,6 +143,7 @@ struct Running {
     samples: FrameSamples,
     bench_samples: FrameSamples,
     peaks: BenchPeaks,
+    sections: FrameSections,
     automation: Automation,
     capture_tx: Sender<CaptureOutcome>,
     capture_rx: Receiver<CaptureOutcome>,
@@ -342,6 +353,7 @@ impl Running {
             samples: FrameSamples::with_capacity(240),
             bench_samples: FrameSamples::with_capacity(100_000),
             peaks: BenchPeaks::default(),
+            sections: FrameSections::default(),
             automation: Automation::WaitingForWorld,
             capture_tx,
             capture_rx,
@@ -407,9 +419,15 @@ impl Running {
         self.last_frame = frame_start;
         self.frame_index += 1;
 
+        let ms_since = |t: Instant| t.elapsed().as_secs_f64() * 1.0e3;
         self.poll_files(args);
         self.poll_startup(args);
+        let mut sections = FrameSections {
+            polls_ms: ms_since(frame_start),
+            ..Default::default()
+        };
 
+        let update_start = Instant::now();
         {
             profiling::scope!("update");
             let (w, h) = self.renderer.surface_size();
@@ -420,7 +438,9 @@ impl Running {
             }
             self.scripted_edit(args);
         }
+        sections.update_ms = ms_since(update_start);
 
+        let egui_start = Instant::now();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let overlay_data = self.overlay_data(args);
         let full_output = {
@@ -434,7 +454,9 @@ impl Running {
         let primitives = self
             .egui_ctx
             .tessellate(full_output.shapes, pixels_per_point);
+        sections.egui_ms = ms_since(egui_start);
 
+        let draw_list_start = Instant::now();
         let voxel_size_m = self
             .world
             .as_ref()
@@ -444,6 +466,8 @@ impl Running {
         } else {
             self.draws.clear();
         }
+        sections.draw_list_ms = ms_since(draw_list_start);
+        let render_start = Instant::now();
         let rendered = {
             profiling::scope!("render");
             self.renderer.render(FrameInput {
@@ -459,6 +483,8 @@ impl Running {
                 }),
             })
         };
+        sections.render_ms = ms_since(render_start) - rendered.acquire_ms;
+        self.sections = sections;
         let status = rendered.status;
         let cpu_ms = frame_start.elapsed().as_secs_f64() * 1.0e3 - rendered.acquire_ms;
         if status != self.last_status {
@@ -694,6 +720,7 @@ impl Running {
             frame_ms: self.samples.mean_frame_ms(),
             cpu_ms: self.samples.mean_cpu_ms(),
             cpu_ms_max,
+            sections: self.sections,
             camera_m: self.camera.position.m,
             speed_m_s: self.camera.speed_m_s,
             voxel_size_m: config.map(|c| c.voxel_size_m),

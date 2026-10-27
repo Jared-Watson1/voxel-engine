@@ -131,6 +131,8 @@ pub struct World {
     sampler: Arc<TerrainSampler>,
     jobs: JobSystem,
     slots: HashMap<ChunkKey, Slot>,
+    /// Chunks with a GPU mesh, so the draw list never scans the mostly uniform slot map.
+    meshed: HashMap<ChunkKey, MeshHandle>,
     /// Chunk offsets within the view radius, nearest first, computed once.
     offsets: Vec<(IVec3, u64)>,
     centre: Option<ChunkKey>,
@@ -169,6 +171,7 @@ impl World {
             sampler,
             jobs,
             slots: HashMap::new(),
+            meshed: HashMap::new(),
             offsets,
             centre: None,
             scan_cursor: 0,
@@ -337,6 +340,7 @@ impl World {
                     if !slot.has_surface
                         && let Some(handle) = slot.mesh.take()
                     {
+                        self.meshed.remove(&key);
                         renderer.free_mesh(handle);
                     }
                 }
@@ -392,6 +396,7 @@ impl World {
             bytes += size;
             if upload.mesh.is_empty() {
                 if let Some(old) = slot.mesh.take() {
+                    self.meshed.remove(&upload.key);
                     renderer.free_mesh(old);
                 }
                 continue;
@@ -401,6 +406,7 @@ impl World {
                     if let Some(old) = slot.mesh.replace(handle) {
                         renderer.free_mesh(old);
                     }
+                    self.meshed.insert(upload.key, handle);
                     self.stats.uploaded_total += 1;
                 }
                 Err(e) => {
@@ -421,11 +427,9 @@ impl World {
     }
 
     fn refresh_counts(&mut self) {
-        let mut meshed = 0;
         let mut dense = 0;
         let mut pending = 0;
         for slot in self.slots.values() {
-            meshed += usize::from(slot.mesh.is_some());
             match slot.data {
                 ChunkData::Pending => pending += 1,
                 ChunkData::Dense(_) => dense += 1,
@@ -433,7 +437,7 @@ impl World {
             }
         }
         self.stats.resident = self.slots.len();
-        self.stats.meshed = meshed;
+        self.stats.meshed = self.meshed.len();
         self.stats.dense = dense;
         self.stats.pending = pending;
         self.stats.upload_queued = self.uploads.len();
@@ -446,6 +450,7 @@ impl World {
         if let Some(slot) = self.slots.remove(&key) {
             slot.token.cancel();
             if let Some(handle) = slot.mesh {
+                self.meshed.remove(&key);
                 renderer.free_mesh(handle);
             }
             self.stats.voxel_bytes -= slot.bytes;
@@ -458,8 +463,7 @@ impl World {
         profiling::scope!("World::fill_draw_list");
         let start = Instant::now();
         out.clear();
-        for (key, slot) in &self.slots {
-            let Some(handle) = slot.mesh else { continue };
+        for (key, &handle) in &self.meshed {
             let origin = key.origin(&self.config);
             let phase = origin.m.map(|v| v.rem_euclid(MATERIAL_TILE_M));
             out.push(ChunkDraw {
@@ -561,6 +565,7 @@ impl World {
                     self.tx.clone(),
                 );
             } else if let Some(handle) = slot.mesh.take() {
+                self.meshed.remove(&key);
                 renderer.free_mesh(handle);
             }
         }

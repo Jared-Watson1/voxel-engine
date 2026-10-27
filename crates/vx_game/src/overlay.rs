@@ -2,6 +2,7 @@ use glam::DVec3;
 use vx_core::BudgetUse;
 use vx_render::{CullStats, PoolStats};
 
+use crate::app::FrameSections;
 use crate::world::WorldStats;
 
 /// Values shown in the debug overlay, gathered once per frame.
@@ -9,6 +10,7 @@ pub struct OverlayData {
     pub frame_ms: f64,
     pub cpu_ms: f64,
     pub cpu_ms_max: f64,
+    pub sections: FrameSections,
     pub camera_m: DVec3,
     pub speed_m_s: f64,
     pub voxel_size_m: Option<f64>,
@@ -46,6 +48,18 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
                     ui,
                     "cpu work",
                     format!("{:.2} ms mean, {:.2} ms max", d.cpu_ms, d.cpu_ms_max),
+                );
+                row(
+                    ui,
+                    "sections",
+                    format!(
+                        "polls {:.2}, update {:.2}, egui {:.2}, draw list {:.2}, render {:.2} ms",
+                        d.sections.polls_ms,
+                        d.sections.update_ms,
+                        d.sections.egui_ms,
+                        d.sections.draw_list_ms,
+                        d.sections.render_ms
+                    ),
                 );
                 row(
                     ui,
