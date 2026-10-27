@@ -153,13 +153,6 @@ pub struct RenderSettings {
     pub pools: TerrainPoolConfig,
 }
 
-/// A triangle mesh in metres relative to its own origin, counter clockwise front faces.
-pub struct MeshData<'a> {
-    pub positions: &'a [[f32; 3]],
-    pub normals: &'a [[f32; 3]],
-    pub indices: &'a [u32],
-}
-
 /// egui output for one frame, already tessellated.
 pub struct EguiFrame<'a> {
     pub primitives: &'a [egui::ClippedPrimitive],
@@ -172,9 +165,6 @@ pub struct EguiFrame<'a> {
 pub struct FrameInput<'a> {
     /// Projection times the rotation only view matrix.
     pub view_proj: Mat4,
-    /// Camera relative position of the mesh origin, computed in f64 by the caller (M0 path,
-    /// removed when the pooled path lands).
-    pub mesh_offset_m: Vec3,
     /// Every resident chunk with its camera relative offset; the compute pass culls them.
     pub chunks: &'a [ChunkDraw],
     /// Scales packed vertex positions (1/1024 voxel units) to metres.
@@ -369,14 +359,6 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth_view(&self.device, width, height);
-    }
-
-    /// Replaces the M0 terrain mesh. An empty mesh clears it. Compatibility path: the mesh is
-    /// packed at the next frame's `voxel_size_m`, uploaded into the pools like any chunk and drawn
-    /// at [`FrameInput::mesh_offset_m`] with material 1. Removed when the game calls
-    /// [`Renderer::upload_mesh`] directly.
-    pub fn set_mesh(&mut self, mesh: &MeshData) {
-        self.terrain.set_mesh(mesh);
     }
 
     /// Copies a packed mesh into the pools and returns its chunk slot. The slot is written into

@@ -19,3 +19,6 @@ target/
 # Local environment
 .env
 .envrc
+
+# Agent worktrees
+.claude/worktrees/

@@ -9,14 +9,14 @@ use std::collections::BinaryHeap;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use vx_core::{CHUNK_SIZE, PackedVertex, VertexAttributes};
+use vx_core::{CHUNK_SIZE, PackedVertex};
 
 use crate::cull::{CullPass, FLAG_RESIDENT, MAX_SLOTS, frustum_planes};
 use crate::materials::MaterialArray;
 use crate::pool::{Range, RangeAllocator};
 use crate::{
-    ChunkDraw, CullStats, DEPTH_COMPARE, DEPTH_FORMAT, FrameInput, MATERIAL_TILE_M,
-    MaterialTextures, MeshData, MeshHandle, PoolError, PoolStats, TerrainPoolConfig,
+    CullStats, DEPTH_COMPARE, DEPTH_FORMAT, FrameInput, MATERIAL_TILE_M, MaterialTextures,
+    MeshHandle, PoolError, PoolStats, TerrainPoolConfig,
 };
 
 /// Built in copy of `assets/shaders/terrain.wgsl`, so the first frame needs no file I/O. The file
@@ -104,15 +104,6 @@ struct ResidentMesh {
     index_count: u32,
 }
 
-/// M0 compatibility for [`crate::Renderer::set_mesh`]: the mesh is packed at the frame's voxel
-/// size on the next frame and drawn at `FrameInput::mesh_offset_m` with material 1. Removed when
-/// the game moves to `upload_mesh`.
-struct LegacyMesh {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    indices: Vec<u32>,
-}
-
 pub(crate) struct TerrainPass {
     vertex_pool: wgpu::Buffer,
     index_pool: wgpu::Buffer,
@@ -136,8 +127,6 @@ pub(crate) struct TerrainPass {
     cull: CullPass,
     frame_index: u64,
     slot_count_this_frame: u32,
-    legacy_pending: Option<LegacyMesh>,
-    legacy_handle: Option<MeshHandle>,
 }
 
 impl TerrainPass {
@@ -223,8 +212,6 @@ impl TerrainPass {
             cull,
             frame_index: 0,
             slot_count_this_frame: 0,
-            legacy_pending: None,
-            legacy_handle: None,
         }
     }
 
@@ -326,22 +313,6 @@ impl TerrainPass {
         Ok((self.slots.len() - 1) as u16)
     }
 
-    pub(crate) fn set_mesh(&mut self, mesh: &MeshData) {
-        debug_assert_eq!(mesh.positions.len(), mesh.normals.len());
-        if mesh.indices.is_empty() {
-            self.legacy_pending = None;
-            if let Some(handle) = self.legacy_handle.take() {
-                self.free_mesh(handle);
-            }
-            return;
-        }
-        self.legacy_pending = Some(LegacyMesh {
-            positions: mesh.positions.to_vec(),
-            normals: mesh.normals.to_vec(),
-            indices: mesh.indices.to_vec(),
-        });
-    }
-
     pub(crate) fn set_material_textures(
         &mut self,
         device: &wgpu::Device,
@@ -371,8 +342,8 @@ impl TerrainPass {
         self.cull.cull_stats(self.frame_index)
     }
 
-    /// Collects finished readbacks, uploads a pending M0 mesh, builds the chunk table and writes
-    /// the frame's uniform and counters. Queue writes land before the frame's submission.
+    /// Collects finished readbacks, builds the chunk table and writes the frame's uniform and
+    /// counters. Queue writes land before the frame's submission.
     pub(crate) fn prepare_frame(
         &mut self,
         device: &wgpu::Device,
@@ -383,26 +354,10 @@ impl TerrainPass {
         self.frame_index += 1;
         self.cull.poll_readback(device);
 
-        if let Some(legacy) = self.legacy_pending.take() {
-            if let Some(handle) = self.legacy_handle.take() {
-                self.free_mesh(handle);
-            }
-            let packed = pack_legacy(&legacy, frame.voxel_size_m);
-            match self.upload_mesh(queue, &packed, &legacy.indices) {
-                Ok(handle) => self.legacy_handle = Some(handle),
-                Err(e) => tracing::error!("M0 mesh upload failed: {e}"),
-            }
-        }
-        let legacy_draw = self.legacy_handle.map(|handle| ChunkDraw {
-            handle,
-            offset_m: frame.mesh_offset_m,
-            texture_phase_m: Vec3::ZERO,
-        });
-
         let slot_count = self.slots.len().max(1);
         self.table.clear();
         self.table.resize(slot_count, ChunkEntry::zeroed());
-        for draw in frame.chunks.iter().chain(legacy_draw.as_ref()) {
+        for draw in frame.chunks {
             let slot = usize::from(draw.handle.0);
             // A handle freed earlier this frame has no mesh and is skipped, never drawn.
             let Some(Some(mesh)) = self.slots.get(slot) else {
@@ -531,20 +486,6 @@ fn frame_bind_group(
     })
 }
 
-fn pack_legacy(mesh: &LegacyMesh, voxel_size_m: f32) -> Vec<PackedVertex> {
-    mesh.positions
-        .iter()
-        .zip(&mesh.normals)
-        .map(|(&position_m, &normal)| {
-            PackedVertex::pack(&VertexAttributes {
-                position_voxels: Vec3::from(position_m) / voxel_size_m,
-                normal: Vec3::from(normal),
-                materials: [(1, 15), (0, 0), (0, 0), (0, 0)],
-            })
-        })
-        .collect()
-}
-
 /// Builds the pipeline inside a validation error scope, because WGSL errors surface at module
 /// creation and entry point or binding mismatches only at pipeline creation. No vertex buffers:
 /// the vertex shader pulls from the pool by `vertex_index`.
@@ -605,8 +546,9 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChunkDraw;
     use crate::cull::Counters;
-    use vx_core::Projection;
+    use vx_core::{Projection, VertexAttributes};
 
     /// A device without a surface, or `None` when the machine has no adapter (CI).
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -696,7 +638,6 @@ mod tests {
         ];
         let frame = FrameInput {
             view_proj,
-            mesh_offset_m: Vec3::ZERO,
             chunks: &chunks,
             voxel_size_m: 1.0,
             sun_dir: Vec3::Y,

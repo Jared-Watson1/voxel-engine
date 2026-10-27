@@ -14,7 +14,7 @@ mod store;
 pub use brush::{Brush, BrushOp, BrushShape};
 pub use chunk::{Chunk, DISTANCE_UNITS_PER_VOXEL, Material, SAMPLES_PER_AXIS, Voxel};
 pub use key::ChunkKey;
-pub use mesh::{ChunkMesh, PackedMesh, mesh_chunk, mesh_regular};
+pub use mesh::{PackedMesh, mesh_chunk};
 pub use store::ChunkStore;
 
 #[cfg(test)]

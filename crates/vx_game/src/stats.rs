@@ -37,6 +37,10 @@ impl FrameSamples {
     pub fn mean_cpu_ms(&self) -> f64 {
         mean(&self.cpu_ms)
     }
+
+    pub fn max_cpu_ms(&self) -> f64 {
+        self.cpu_ms.iter().copied().fold(0.0, f64::max)
+    }
 }
 
 fn mean(v: &VecDeque<f64>) -> f64 {

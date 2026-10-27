@@ -4,10 +4,11 @@ mod app;
 mod args;
 mod camera;
 mod capture;
+mod flight;
 mod overlay;
 mod profiler;
-mod scene;
 mod stats;
+mod world;
 
 use tracing_subscriber::EnvFilter;
 use winit::event_loop::{ControlFlow, EventLoop};

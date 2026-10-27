@@ -53,8 +53,13 @@ struct VertexOut {
     // Chunk local position plus the chunk's texture phase: periodic in the tile length and
     // independent of the camera.
     @location(1) triplanar_m: vec3<f32>,
-    @location(2) @interpolate(flat) material_ids: vec4<u32>,
-    @location(3) material_weights: vec4<f32>,
+    // One weight per material id (0 to 15), so interpolation across a triangle blends
+    // materials, never slots: a slot that is empty on one vertex and soil on another would
+    // otherwise interpolate a weight onto whichever id the provoking vertex holds.
+    @location(2) weights0: vec4<f32>,
+    @location(3) weights1: vec4<f32>,
+    @location(4) weights2: vec4<f32>,
+    @location(5) weights3: vec4<f32>,
 };
 
 // Byte `shift` to `shift + 7` of `word` as a two's complement value in -127 to 127, scaled to
@@ -90,18 +95,15 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
     out.clip = frame.view_proj * vec4<f32>(local_m + chunk.offset_m, 1.0);
     out.normal = normal;
     out.triplanar_m = local_m + chunk.texture_phase_m;
-    out.material_ids = vec4<u32>(
-        v.z & 0xfu,
-        (v.z >> 4u) & 0xfu,
-        (v.z >> 8u) & 0xfu,
-        (v.z >> 12u) & 0xfu,
-    );
-    out.material_weights = vec4<f32>(
-        f32((v.z >> 16u) & 0xfu),
-        f32((v.z >> 20u) & 0xfu),
-        f32((v.z >> 24u) & 0xfu),
-        f32((v.z >> 28u) & 0xfu),
-    );
+    var w = array<f32, 16>();
+    for (var i = 0u; i < 4u; i++) {
+        let id = (v.z >> (4u * i)) & 0xfu;
+        w[id] += f32((v.z >> (16u + 4u * i)) & 0xfu);
+    }
+    out.weights0 = vec4<f32>(w[0], w[1], w[2], w[3]);
+    out.weights1 = vec4<f32>(w[4], w[5], w[6], w[7]);
+    out.weights2 = vec4<f32>(w[8], w[9], w[10], w[11]);
+    out.weights3 = vec4<f32>(w[12], w[13], w[14], w[15]);
     return out;
 }
 
@@ -124,14 +126,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let p = in.triplanar_m / frame.params.z;
     let dx = dpdx(p);
     let dy = dpdy(p);
-    let total = in.material_weights.x + in.material_weights.y + in.material_weights.z
-        + in.material_weights.w;
+    var weights = array<vec4<f32>, 4>(in.weights0, in.weights1, in.weights2, in.weights3);
+    let ones = vec4<f32>(1.0);
+    let total = dot(in.weights0, ones) + dot(in.weights1, ones) + dot(in.weights2, ones)
+        + dot(in.weights3, ones);
     var albedo = vec3<f32>(0.0);
     if total > 0.0 {
-        for (var i = 0u; i < 4u; i++) {
-            let weight = in.material_weights[i];
+        for (var i = 0u; i < 16u; i++) {
+            let weight = weights[i / 4u][i % 4u];
             if weight > 0.0 {
-                albedo += triplanar(in.material_ids[i], p, dx, dy, blend) * (weight / total);
+                albedo += triplanar(i, p, dx, dy, blend) * (weight / total);
             }
         }
     } else {

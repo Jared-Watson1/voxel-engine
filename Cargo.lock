@@ -3083,13 +3083,12 @@ dependencies = [
  "profiling",
  "puffin",
  "puffin_http",
- "ron",
- "serde",
  "tracing",
  "tracing-subscriber",
  "vx_core",
  "vx_render",
  "vx_voxel",
+ "vx_worldgen",
  "winit",
 ]
 
@@ -3117,6 +3116,12 @@ dependencies = [
 [[package]]
 name = "vx_tools"
 version = "0.1.0"
+dependencies = [
+ "glam",
+ "vx_core",
+ "vx_voxel",
+ "vx_worldgen",
+]
 
 [[package]]
 name = "vx_universe"

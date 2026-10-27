@@ -9,7 +9,7 @@ use transvoxel::traits::mesh_builder::MeshBuilder;
 use transvoxel::traits::voxel_block::VoxelBlock;
 use transvoxel::traits::voxel_data::{Density, VoxelData};
 use vx_core::mesh::{MATERIAL_SLOTS, MAX_MATERIAL_WEIGHT};
-use vx_core::{CHUNK_SIZE, PackedVertex, VertexAttributes, WorldPos};
+use vx_core::{CHUNK_SIZE, PackedVertex, VertexAttributes};
 
 use crate::chunk::{Chunk, Material, Voxel};
 use crate::key::ChunkKey;
@@ -254,52 +254,4 @@ fn neighbour_weight(count: u8) -> u8 {
     let max = u16::from(MAX_MATERIAL_WEIGHT);
     let neighbours = FACE_NEIGHBOURS.len() as u16;
     ((max * u16::from(count) + neighbours / 2) / neighbours).clamp(1, max) as u8
-}
-
-/// Indexed triangle mesh of one chunk in chunk local metres (relative to [`ChunkMesh::origin`]),
-/// counter clockwise front faces seen from outside the solid.
-///
-/// The M0 form: f32 positions and normals unpacked from [`PackedMesh`] for the renderer until it
-/// consumes packed vertices directly (D14).
-#[derive(Debug, Clone, Default)]
-pub struct ChunkMesh {
-    pub origin: WorldPos,
-    pub positions: Vec<[f32; 3]>,
-    /// Unit normals from the signed distance gradient, pointing out of the solid.
-    pub normals: Vec<[f32; 3]>,
-    pub indices: Vec<u32>,
-}
-
-impl ChunkMesh {
-    pub fn triangle_count(&self) -> usize {
-        self.indices.len() / 3
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
-    }
-}
-
-/// [`mesh_chunk`] unpacked to f32 metres relative to the chunk origin.
-pub fn mesh_regular(chunk: &Chunk) -> ChunkMesh {
-    profiling::scope!("mesh_regular");
-    let packed = mesh_chunk(chunk);
-    let voxel_size_m = chunk.voxel_size_m() as f32;
-    let (positions, normals) = packed
-        .vertices
-        .iter()
-        .map(|vertex| {
-            let attributes = vertex.unpack();
-            (
-                (attributes.position_voxels * voxel_size_m).to_array(),
-                attributes.normal.to_array(),
-            )
-        })
-        .unzip();
-    ChunkMesh {
-        origin: chunk.origin(),
-        positions,
-        normals,
-        indices: packed.indices,
-    }
 }

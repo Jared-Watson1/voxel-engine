@@ -47,6 +47,7 @@ Versions are the latest stable on crates.io when added (2026-10-26). All pure Ru
 | serde, ron | 1.0.229, 0.12.2 | MIT OR Apache-2.0 | vx_core, vx_game | `WorldConfig` and scene config files (D11) | M0 |
 | transvoxel | 2.0.0 | MIT OR Apache-2.0 | vx_voxel | Transvoxel regular cells now, transition cells in M2 (D2); pulls `transvoxel-data` 0.2.1 (MIT on crates.io; the vault still lists the license of Lengyel's original tables as unverified), `num` 0.4 and `flagset` 0.4 (Apache-2.0) | M0 |
 | png | 0.18.1 | MIT OR Apache-2.0 | vx_game | screenshot encoding on a worker thread | M0 |
+| fastnoise-lite | 1.1.1 | MIT | vx_worldgen | OpenSimplex2 and fBm noise, pure safe Rust, no transcendentals, `f64` input feature; deterministic across machines (D13); pulls only `num-traits` | M1 |
 
 ## Crate layout
 
@@ -99,14 +100,17 @@ These follow from the pillars in the design document. The pillar order (performa
 ```
 cargo run --release -p vx_game                                  run the engine
 cargo run --release -p vx_game --features profile               with the puffin server on 127.0.0.1:8585 (view with puffin_viewer)
-cargo run --release -p vx_game -- --bench-seconds 30            measure frame times after warm up, print a BENCH line, exit
-cargo run --release -p vx_game -- --no-vsync --voxel-size 0.5   uncapped, with a one run voxel size override
-cargo run --release -p vx_game -- --screenshot out.png          save a PNG after warm up and exit
+cargo run --release -p vx_game -- --flight-km 2                 fly a 2 km square loop over the terrain, print a BENCH line, exit
+cargo run --release -p vx_game -- --flight-km 2 --edit-test     the same with scripted dig and place brushes during the flight
+cargo run --release -p vx_game -- --bench-seconds 30            measure frame times from a standing start, print a BENCH line, exit
+cargo run --release -p vx_game -- --no-vsync --voxel-size 0.5   uncapped, with a one run voxel size override (also --view-radius, --seed, --workers)
+cargo run --release -p vx_game -- --screenshot out.png          save a PNG after the world settles and exit
+cargo run --release -p vx_tools -- bench-chunk --voxel-size 1.0 generate and mesh medians and p95 for surface chunks on one thread
 cargo test --workspace                                          tests
 cargo clippy --all-targets -- -D warnings                       lints (also run with --features vx_game/profile)
 ```
 
-Automated runs (`--bench-seconds`, `--screenshot`) ignore keyboard and mouse input so the camera stays where it was placed. Performance numbers state the voxel size, resolution and present mode they were measured at; the BENCH line includes all three. `cargo bench -p vx_voxel` arrives with the M1 headless benchmark.
+Automated runs (`--bench-seconds`, `--flight-km`, `--screenshot`) ignore keyboard and mouse input; they wait for the initial streaming to settle, warm up for two seconds, then measure. Performance numbers state the voxel size, view radius, resolution and present mode they were measured at; the BENCH line includes all of them. The headless benchmark is the `vx_tools` subcommand above; it prints a BENCH-CHUNK line.
 
 ## Working here
 

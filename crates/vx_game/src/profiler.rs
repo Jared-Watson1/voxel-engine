@@ -14,13 +14,17 @@ mod enabled {
     static SCOPES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
     /// Spans the engine itself opens; wgpu and egui add their own through the same backend.
-    const ENGINE_SCOPES: [&str; 6] = [
+    const ENGINE_SCOPES: [&str; 10] = [
         "frame",
         "update",
         "render",
-        "chunk job",
-        "Chunk::fill_from",
-        "mesh_regular",
+        "World::update",
+        "World::recentre",
+        "World::poll_results",
+        "World::upload",
+        "World::apply_brush",
+        "TerrainSampler::fill_chunk",
+        "mesh_chunk",
     ];
 
     pub struct Profiler {
