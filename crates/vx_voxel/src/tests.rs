@@ -498,3 +498,59 @@ fn mesh_chunk_timing() {
         );
     }
 }
+
+/// Positions come from the integer world sample index, so the apron copies and the shared face
+/// vertices agree bit for bit at voxel sizes that are not powers of two as well (D16).
+#[test]
+fn shared_face_vertices_are_identical_at_odd_voxel_sizes() {
+    for voxel_size_m in [0.3, 0.7, 1.5, 2.5] {
+        let sdf = |p: DVec3| {
+            let d = p.y - 20.0 * voxel_size_m - 0.3 * p.x - 0.2 * p.z;
+            let material = if p.y > 18.0 * voxel_size_m {
+                crate::Material::GRASS
+            } else {
+                crate::Material::ROCK
+            };
+            (d, material)
+        };
+        let mut a = Chunk::new(ChunkKey::new(0, 0, 0), voxel_size_m);
+        let mut b = Chunk::new(ChunkKey::new(1, 0, 0), voxel_size_m);
+        a.fill_from_with_material(sdf);
+        b.fill_from_with_material(sdf);
+        for x in -1..=1 {
+            for y in -1..=(CHUNK_SIZE as i32 + 1) {
+                for z in -1..=(CHUNK_SIZE as i32 + 1) {
+                    assert_eq!(
+                        a.get((x + CHUNK_SIZE as i32) as isize, y as isize, z as isize),
+                        b.get(x as isize, y as isize, z as isize),
+                        "apron copy differs at local ({x}, {y}, {z}) of chunk B, {voxel_size_m} m"
+                    );
+                }
+            }
+        }
+        let face_x = (CHUNK_SIZE as f32 * vx_core::mesh::POSITION_UNITS_PER_VOXEL) as u32;
+        let mut on_a: Vec<[u32; 4]> = mesh_chunk(&a)
+            .vertices
+            .iter()
+            .map(|v| v.words)
+            .filter(|w| w[0] & 0xFFFF == face_x)
+            .collect();
+        let mut on_b: Vec<[u32; 4]> = mesh_chunk(&b)
+            .vertices
+            .iter()
+            .map(|v| v.words)
+            .filter(|w| w[0] & 0xFFFF == 0)
+            .map(|mut w| {
+                w[0] |= face_x;
+                w
+            })
+            .collect();
+        on_a.sort_unstable();
+        on_b.sort_unstable();
+        assert!(
+            !on_a.is_empty(),
+            "no vertices on the shared face at {voxel_size_m} m"
+        );
+        assert_eq!(on_a, on_b, "shared face differs at {voxel_size_m} m");
+    }
+}

@@ -1,7 +1,7 @@
 use fastnoise_lite::{FastNoiseLite, FractalType, NoiseType};
-use glam::DVec3;
+use glam::{DVec3, IVec3};
 use vx_core::TerrainParams;
-use vx_voxel::{Chunk, DISTANCE_UNITS_PER_VOXEL, Material, SAMPLES_PER_AXIS, Voxel};
+use vx_voxel::{Chunk, ChunkKey, DISTANCE_UNITS_PER_VOXEL, Material, SAMPLES_PER_AXIS, Voxel};
 
 use crate::seed::{STREAM_DETAIL, STREAM_HEIGHT, derive_seed};
 
@@ -110,8 +110,7 @@ impl TerrainSampler {
     pub fn fill_chunk(&self, chunk: &mut Chunk) {
         profiling::scope!("TerrainSampler::fill_chunk");
         let voxel_size_m = chunk.voxel_size_m();
-        let base = chunk.origin().m;
-        let plan = FillPlan::new(base, voxel_size_m);
+        let plan = FillPlan::new(chunk.key(), voxel_size_m);
         let detail_amplitude_m = self.params.detail_amplitude_m;
         let sf_min = self.slope_factor_min;
 
@@ -322,7 +321,10 @@ struct FillPlan {
     y_hi: f64,
     inv_voxel: f64,
     voxel_size_m: f64,
-    base: DVec3,
+    /// World sample index of local sample (0, 0, 0), the base of every position: positions are
+    /// `(index) as f64 * voxel_size_m` with one rounding, as `Chunk::sample_position` computes
+    /// them, so apron copies agree bit for bit (D16).
+    first_sample: IVec3,
     /// One quantisation unit in metres.
     unit_m: f64,
     /// A sample whose distance lies this far outside the surface quantises to the saturated value
@@ -334,23 +336,24 @@ struct FillPlan {
 }
 
 impl FillPlan {
-    fn new(base: DVec3, voxel_size_m: f64) -> Self {
+    fn new(key: ChunkKey, voxel_size_m: f64) -> Self {
         let unit_m = voxel_size_m / f64::from(DISTANCE_UNITS_PER_VOXEL);
         let band_m = f64::from(i8::MAX) * unit_m;
         let skip_m = band_m + unit_m;
-        let axis = |origin: f64| -> [f64; N] {
-            std::array::from_fn(|i| origin + (i as f64 - 1.0) * voxel_size_m)
+        let first_sample = key.world_sample(IVec3::ZERO);
+        let axis = |first: i32| -> [f64; N] {
+            std::array::from_fn(|i| f64::from(first + i as i32 - 1) * voxel_size_m)
         };
-        let ys = axis(base.y);
+        let ys = axis(first_sample.y);
         Self {
-            xs: axis(base.x),
+            xs: axis(first_sample.x),
             ys,
-            zs: axis(base.z),
+            zs: axis(first_sample.z),
             y_lo: ys[0],
             y_hi: ys[N - 1],
             inv_voxel: 1.0 / voxel_size_m,
             voxel_size_m,
-            base,
+            first_sample,
             unit_m,
             skip_m,
             coarse_skip_m: skip_m + unit_m,
@@ -386,16 +389,16 @@ impl SharedHeights {
         step: usize,
     ) -> Self {
         let width = N + 2 * step;
-        let axis = |origin: f64| -> Vec<f64> {
+        let axis = |first: i32| -> Vec<f64> {
             (0..width)
                 .map(|g| {
-                    let local = g as isize - step as isize;
-                    origin + (local as f64 - 1.0) * plan.voxel_size_m
+                    let local = g as i32 - step as i32;
+                    f64::from(first + local - 1) * plan.voxel_size_m
                 })
                 .collect()
         };
-        let xs = axis(plan.base.x);
-        let zs = axis(plan.base.z);
+        let xs = axis(plan.first_sample.x);
+        let zs = axis(plan.first_sample.z);
         let mut heights = vec![0.0f64; width * width];
         for gz in 0..width {
             for gx in 0..width {

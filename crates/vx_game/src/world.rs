@@ -3,7 +3,9 @@
 //! remesh at priority across chunk borders (D16).
 //!
 //! The main thread only schedules, drains result channels, uploads within the per frame byte
-//! budget and answers picking rays; every generate and mesh runs on a worker.
+//! budget and answers picking rays; every generate and mesh runs on a worker. Every walk the main
+//! thread makes over the resident set is bounded per frame, so the cost does not grow with the
+//! view radius within one frame.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -26,11 +28,15 @@ pub const STAGE_NAMES: [&str; 2] = ["generate", "mesh"];
 
 /// Seconds between repeated pool full log lines.
 const POOL_FULL_LOG_INTERVAL_S: f64 = 2.0;
-/// Generate jobs queued per frame while filling the view radius, so a recentre spreads its
-/// scheduling over frames instead of spiking the main thread; nearest chunks go first.
+/// Slot map lookups per frame for the nearest first scan and for eviction, so a recentre spreads
+/// its scheduling over frames instead of spiking the main thread.
+const CHECKS_PER_FRAME: usize = 4096;
+/// Generate jobs queued per frame.
 const SPAWNS_PER_FRAME: usize = 1024;
 /// Frames between full scans of the slot map for the overlay counts.
 const COUNT_REFRESH_FRAMES: u64 = 30;
+/// Frames an upload is retried when a pool is full before the mesh is dropped.
+const UPLOAD_RETRY_FRAMES: u32 = 120;
 
 enum ChunkData {
     /// Generation in flight; nothing to read or edit yet.
@@ -41,7 +47,8 @@ enum ChunkData {
 }
 
 struct Slot {
-    /// Bumped on every regenerate or edit; results tagged with an older generation are dropped.
+    /// Taken from a world wide counter on every generate or edit, so a result from an earlier
+    /// generation of this key, or from a previous residency of it, is dropped.
     generation: u64,
     data: ChunkData,
     mesh: Option<MeshHandle>,
@@ -49,7 +56,9 @@ struct Slot {
     /// Cancels the job in flight for the current generation.
     token: CancelToken,
     bytes: usize,
-    distance_sq: u64,
+    /// A brush reached this chunk while it was pending: regenerate once the result arrives so the
+    /// edit log is applied, instead of losing the edit on this chunk alone.
+    regenerate: bool,
 }
 
 enum Message {
@@ -73,6 +82,7 @@ struct Upload {
     seq: u64,
     key: ChunkKey,
     generation: u64,
+    retries: u32,
     mesh: PackedMesh,
 }
 
@@ -122,6 +132,8 @@ pub struct WorldStats {
     pub update_ms_max: f64,
     pub draw_list_ms: f64,
     pub edits: u64,
+    /// Brushes recorded in the edit log over every chunk.
+    pub edit_log_entries: usize,
     pub queued_peak: usize,
     pub stages: Vec<StageStats>,
 }
@@ -133,11 +145,19 @@ pub struct World {
     slots: HashMap<ChunkKey, Slot>,
     /// Chunks with a GPU mesh, so the draw list never scans the mostly uniform slot map.
     meshed: HashMap<ChunkKey, MeshHandle>,
+    /// Every brush applied to each chunk, in order, for the whole session. A generate job
+    /// replays the chunk's entries after sampling, so an edit survives eviction and re-streaming
+    /// and reaches chunks that were still pending when the brush was applied (D16).
+    edit_log: HashMap<ChunkKey, Vec<Brush>>,
     /// Chunk offsets within the view radius, nearest first, computed once.
     offsets: Vec<(IVec3, u64)>,
     centre: Option<ChunkKey>,
     /// Next entry of `offsets` to check for a missing chunk; reset to 0 on every recentre.
     scan_cursor: usize,
+    /// Keys snapshotted at the last recentre, checked for eviction a bounded number per frame.
+    evict_queue: Vec<ChunkKey>,
+    evict_cursor: usize,
+    next_generation: u64,
     frame: u64,
     tx: Sender<Message>,
     rx: Receiver<Message>,
@@ -172,9 +192,13 @@ impl World {
             jobs,
             slots: HashMap::new(),
             meshed: HashMap::new(),
+            edit_log: HashMap::new(),
             offsets,
             centre: None,
             scan_cursor: 0,
+            evict_queue: Vec::new(),
+            evict_cursor: 0,
+            next_generation: 1,
             frame: 0,
             tx,
             rx,
@@ -202,13 +226,14 @@ impl World {
     pub fn is_settled(&self) -> bool {
         self.centre.is_some()
             && self.scan_cursor >= self.offsets.len()
+            && self.evict_cursor >= self.evict_queue.len()
             && self.uploads.is_empty()
             && self.jobs.queued_total() == 0
             && self.jobs.all_stats().iter().all(|s| s.running == 0)
             && self
                 .slots
                 .values()
-                .all(|s| !matches!(s.data, ChunkData::Pending))
+                .all(|s| !matches!(s.data, ChunkData::Pending) && !s.regenerate)
     }
 
     /// Runs the main thread part of the pipeline for one frame: streaming around `camera`,
@@ -220,11 +245,12 @@ impl World {
         let key = ChunkKey::containing(camera, &self.config);
         if self.centre != Some(key) {
             let recentre_start = Instant::now();
-            self.recentre(key, renderer);
+            self.recentre(key);
             let ms = recentre_start.elapsed().as_secs_f64() * 1.0e3;
             self.stats.stream_ms_last = ms;
             self.stats.stream_ms_max = self.stats.stream_ms_max.max(ms);
         }
+        self.evict(renderer);
         self.scan();
         self.poll_results(renderer);
         self.upload(renderer);
@@ -236,43 +262,62 @@ impl World {
         self.stats.update_ms_max = self.stats.update_ms_max.max(ms);
     }
 
-    /// Evicts chunks beyond the evict radius and restarts the nearest first scan for missing ones.
-    fn recentre(&mut self, centre: ChunkKey, renderer: &mut Renderer) {
+    /// Restarts the nearest first scan and snapshots the keys to check for eviction.
+    fn recentre(&mut self, centre: ChunkKey) {
         profiling::scope!("World::recentre");
         self.centre = Some(centre);
         self.scan_cursor = 0;
-        let evict_sq = u64::from(self.config.evict_radius_chunks()).pow(2);
-        let mut gone = Vec::new();
-        for (key, slot) in &mut self.slots {
-            slot.distance_sq = key.distance_sq(centre);
-            if slot.distance_sq > evict_sq {
-                gone.push(*key);
-            }
-        }
-        for key in gone {
-            self.remove(key, renderer);
-        }
-        self.refresh_counts();
+        self.evict_queue.clear();
+        self.evict_queue.extend(self.slots.keys().copied());
+        self.evict_cursor = 0;
     }
 
-    /// Queues generation for up to `SPAWNS_PER_FRAME` missing chunks, nearest first.
+    /// Removes up to `CHECKS_PER_FRAME` chunks beyond the evict radius.
+    fn evict(&mut self, renderer: &mut Renderer) {
+        let Some(centre) = self.centre else { return };
+        let evict_sq = u64::from(self.config.evict_radius_chunks()).pow(2);
+        let end = (self.evict_cursor + CHECKS_PER_FRAME).min(self.evict_queue.len());
+        for i in self.evict_cursor..end {
+            let key = self.evict_queue[i];
+            if key.distance_sq(centre) > evict_sq {
+                self.remove(key, renderer);
+            }
+        }
+        self.evict_cursor = end;
+    }
+
+    /// Queues generation for missing chunks, nearest first, checking at most `CHECKS_PER_FRAME`
+    /// keys and queuing at most `SPAWNS_PER_FRAME` jobs per frame.
     fn scan(&mut self) {
         let Some(centre) = self.centre else { return };
         let mut spawned = 0;
-        while self.scan_cursor < self.offsets.len() && spawned < SPAWNS_PER_FRAME {
+        let mut checked = 0;
+        while self.scan_cursor < self.offsets.len()
+            && spawned < SPAWNS_PER_FRAME
+            && checked < CHECKS_PER_FRAME
+        {
             let (offset, distance_sq) = self.offsets[self.scan_cursor];
             self.scan_cursor += 1;
+            checked += 1;
             let key = centre.offset(offset.x, offset.y, offset.z);
             if !self.slots.contains_key(&key) {
-                self.spawn_generate(key, distance_sq);
+                self.spawn_generate(key, Priority::streaming(distance_sq));
                 spawned += 1;
             }
         }
     }
 
-    fn spawn_generate(&mut self, key: ChunkKey, distance_sq: u64) {
+    fn take_generation(&mut self) -> u64 {
+        let g = self.next_generation;
+        self.next_generation += 1;
+        g
+    }
+
+    /// Queues a generate job for `key`; the job samples the terrain, replays the chunk's edit log
+    /// and, when the chunk has a surface, queues the mesh job itself.
+    fn spawn_generate(&mut self, key: ChunkKey, priority: Priority) {
         let token = CancelToken::new();
-        let generation = 1;
+        let generation = self.take_generation();
         self.slots.insert(
             key,
             Slot {
@@ -282,10 +327,10 @@ impl World {
                 has_surface: false,
                 token: token.clone(),
                 bytes: 0,
-                distance_sq,
+                regenerate: false,
             },
         );
-        let priority = Priority::streaming(distance_sq);
+        let edits: Vec<Brush> = self.edit_log.get(&key).cloned().unwrap_or_default();
         let sampler = self.sampler.clone();
         let config = self.config;
         let tx = self.tx.clone();
@@ -295,6 +340,9 @@ impl World {
                 let start = Instant::now();
                 let mut chunk = Chunk::for_key(key, &config);
                 sampler.fill_chunk(&mut chunk);
+                for brush in &edits {
+                    brush.apply(&mut chunk);
+                }
                 let store = ChunkStore::compress(&chunk);
                 let generate_ms = start.elapsed().as_secs_f64() * 1.0e3;
                 if token.is_cancelled() {
@@ -316,6 +364,7 @@ impl World {
 
     fn poll_results(&mut self, renderer: &mut Renderer) {
         profiling::scope!("World::poll_results");
+        let mut regenerate = Vec::new();
         while let Ok(message) = self.rx.try_recv() {
             match message {
                 Message::Generated {
@@ -343,6 +392,9 @@ impl World {
                         self.meshed.remove(&key);
                         renderer.free_mesh(handle);
                     }
+                    if std::mem::take(&mut slot.regenerate) {
+                        regenerate.push(key);
+                    }
                 }
                 Message::Meshed {
                     key,
@@ -365,9 +417,24 @@ impl World {
                         seq: self.upload_seq,
                         key,
                         generation,
+                        retries: 0,
                         mesh,
                     }));
                 }
+            }
+        }
+        // A brush reached these chunks while they were pending: run generation again so the job
+        // applies the edit log, and drop the mesh of the unedited result by bumping the generation.
+        for key in regenerate {
+            if let Some(slot) = self.slots.get(&key) {
+                slot.token.cancel();
+                let bytes = slot.bytes;
+                let distance_sq = self.centre.map_or(0, |c| key.distance_sq(c));
+                self.stats.voxel_bytes -= bytes;
+                if let Some(handle) = self.meshed.remove(&key) {
+                    renderer.free_mesh(handle);
+                }
+                self.spawn_generate(key, Priority::streaming(distance_sq));
             }
         }
         self.stats.voxel_bytes_peak = self.stats.voxel_bytes_peak.max(self.stats.voxel_bytes);
@@ -375,6 +442,7 @@ impl World {
 
     /// Copies queued meshes to the GPU, nearest and edited first, until the per frame byte budget
     /// is reached. At least one mesh is uploaded per frame so a single large mesh cannot stall.
+    /// A full pool stops the frame's uploads; the mesh is retried for `UPLOAD_RETRY_FRAMES`.
     fn upload(&mut self, renderer: &mut Renderer) {
         profiling::scope!("World::upload");
         let start = Instant::now();
@@ -384,7 +452,7 @@ impl World {
             if bytes > 0 && bytes + size > Budgets::UPLOAD_BYTES_PER_FRAME {
                 break;
             }
-            let Some(Reverse(upload)) = self.uploads.pop() else {
+            let Some(Reverse(mut upload)) = self.uploads.pop() else {
                 break;
             };
             let Some(slot) = self.slots.get_mut(&upload.key) else {
@@ -410,7 +478,6 @@ impl World {
                     self.stats.uploaded_total += 1;
                 }
                 Err(e) => {
-                    self.stats.upload_failures += 1;
                     let due = self
                         .last_pool_full_log
                         .is_none_or(|t| t.elapsed().as_secs_f64() > POOL_FULL_LOG_INTERVAL_S);
@@ -418,6 +485,13 @@ impl World {
                         tracing::error!("mesh upload failed for {:?}: {e}", upload.key);
                         self.last_pool_full_log = Some(Instant::now());
                     }
+                    upload.retries += 1;
+                    if upload.retries < UPLOAD_RETRY_FRAMES {
+                        self.uploads.push(Reverse(upload));
+                    } else {
+                        self.stats.upload_failures += 1;
+                    }
+                    break;
                 }
             }
         }
@@ -441,6 +515,7 @@ impl World {
         self.stats.dense = dense;
         self.stats.pending = pending;
         self.stats.upload_queued = self.uploads.len();
+        self.stats.edit_log_entries = self.edit_log.values().map(Vec::len).sum();
         self.stats.stages = self.jobs.all_stats();
         let queued = self.jobs.queued_total() + self.uploads.len();
         self.stats.queued_peak = self.stats.queued_peak.max(queued);
@@ -457,8 +532,7 @@ impl World {
         }
     }
 
-    /// Every resident mesh with its camera relative offset, computed in f64 (D4), nearest first
-    /// is not required because the GPU culls.
+    /// Every resident mesh with its camera relative offset, computed in f64 (D4).
     pub fn fill_draw_list(&mut self, camera: WorldPos, out: &mut Vec<ChunkDraw>) {
         profiling::scope!("World::fill_draw_list");
         let start = Instant::now();
@@ -475,9 +549,8 @@ impl World {
         self.stats.draw_list_ms = start.elapsed().as_secs_f64() * 1.0e3;
     }
 
-    /// Reads the stored sample containing `p`, or `None` where no generated chunk holds it.
-    pub fn sample_at(&self, p: DVec3) -> Option<Voxel> {
-        let ws = (p / self.config.voxel_size_m).floor().as_ivec3();
+    /// The stored sample at a world sample index, or `None` where no generated chunk holds it.
+    fn sample_at_index(&self, ws: IVec3) -> Option<Voxel> {
         let n = CHUNK_SIZE as i32;
         let key = ChunkKey::new(ws.x.div_euclid(n), ws.y.div_euclid(n), ws.z.div_euclid(n));
         let local = ws - key.as_ivec3() * n;
@@ -490,8 +563,30 @@ impl World {
         }
     }
 
+    /// Signed distance in voxels at `p`, trilinear between the eight surrounding samples, which is
+    /// the surface the mesher draws. `None` where a surrounding chunk is not generated.
+    pub fn distance_voxels_at(&self, p: DVec3) -> Option<f64> {
+        let f = p / self.config.voxel_size_m;
+        let base = f.floor();
+        let t = f - base;
+        let base = base.as_ivec3();
+        let mut d = 0.0;
+        for corner in 0..8u32 {
+            let offset = IVec3::new(
+                (corner & 1) as i32,
+                ((corner >> 1) & 1) as i32,
+                ((corner >> 2) & 1) as i32,
+            );
+            let w = (if offset.x == 1 { t.x } else { 1.0 - t.x })
+                * (if offset.y == 1 { t.y } else { 1.0 - t.y })
+                * (if offset.z == 1 { t.z } else { 1.0 - t.z });
+            d += w * f64::from(self.sample_at_index(base + offset)?.distance_voxels());
+        }
+        Some(d)
+    }
+
     /// Marches a ray through the stored samples in half voxel steps and returns the first point
-    /// inside the solid, refined by bisection to a few millimetres.
+    /// inside the interpolated surface, refined by bisection to a few millimetres.
     pub fn raycast(&self, origin: WorldPos, direction: DVec3, max_m: f64) -> Option<DVec3> {
         profiling::scope!("World::raycast");
         let direction = direction.normalize_or_zero();
@@ -500,8 +595,8 @@ impl World {
         }
         let step = 0.5 * self.config.voxel_size_m;
         let inside = |t: f64| {
-            self.sample_at(origin.m + direction * t)
-                .is_some_and(Voxel::is_inside)
+            self.distance_voxels_at(origin.m + direction * t)
+                .is_some_and(|d| d < 0.0)
         };
         let mut t = 0.0;
         if inside(0.0) {
@@ -526,12 +621,16 @@ impl World {
         None
     }
 
-    /// Applies a brush to every generated chunk it touches, apron copies included, and queues a
-    /// priority remesh of each changed chunk (D9). Returns how many chunks changed.
+    /// Records the brush in the edit log of every chunk it touches and applies it to the
+    /// generated ones, apron copies included, queuing a priority remesh of each changed chunk
+    /// (D9). A chunk still generating is regenerated with the log once its result arrives; a
+    /// chunk not resident replays the log when it streams in. Returns how many chunks changed now.
     pub fn apply_brush(&mut self, brush: &Brush, renderer: &mut Renderer) -> usize {
         profiling::scope!("World::apply_brush");
         let mut changed = 0;
         for key in brush.affected_chunks(&self.config) {
+            self.edit_log.entry(key).or_default().push(*brush);
+            let generation = self.next_generation;
             let Some(slot) = self.slots.get_mut(&key) else {
                 continue;
             };
@@ -544,13 +643,15 @@ impl World {
                 slot.data = ChunkData::Dense(Box::new(chunk));
             }
             let ChunkData::Dense(chunk) = &mut slot.data else {
+                slot.regenerate = true;
                 continue;
             };
             if !brush.apply(chunk) {
                 continue;
             }
             changed += 1;
-            slot.generation += 1;
+            self.next_generation += 1;
+            slot.generation = generation;
             slot.token.cancel();
             slot.token = CancelToken::new();
             slot.has_surface = chunk.has_surface();
@@ -560,7 +661,7 @@ impl World {
                     Priority::EDIT,
                     slot.token.clone(),
                     key,
-                    slot.generation,
+                    generation,
                     (**chunk).clone(),
                     self.tx.clone(),
                 );

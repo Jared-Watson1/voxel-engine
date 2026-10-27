@@ -8,10 +8,11 @@ use vx_core::{
     BudgetMonitor, BudgetUse, Budgets, FileWatcher, JobSystem, Projection, WorldConfig, WorldPos,
 };
 use vx_render::{
-    ChunkDraw, EguiFrame, FrameInput, FrameStatus, MaterialTextures, RenderSettings, Renderer,
+    ChunkDraw, EguiFrame, FrameInput, FrameStatus, MaterialTextures, PreparedMaterialTextures,
+    RenderSettings, Renderer,
 };
 use vx_voxel::{Brush, BrushOp, BrushShape, Material};
-use vx_worldgen::{MaterialTextureSet, material_textures};
+use vx_worldgen::material_textures;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{
@@ -76,7 +77,7 @@ impl App {
 /// Everything loaded off the main thread at startup (D9).
 struct Startup {
     config: WorldConfig,
-    textures: MaterialTextureSet,
+    textures: PreparedMaterialTextures,
     load_ms: f64,
 }
 
@@ -397,7 +398,9 @@ impl Running {
         let config = *world.config();
         let direction = self.camera.orientation() * DVec3::NEG_Z;
         let right = self.camera.orientation() * DVec3::X;
-        let reach = BRUSH_REACH_CHUNKS * config.chunk_extent_m();
+        // Never pick beyond the streamed sphere, so a brush always lands on generated chunks.
+        let reach = BRUSH_REACH_CHUNKS.min(f64::from(config.view_radius_chunks) - 1.0)
+            * config.chunk_extent_m();
         let Some(hit) = world.raycast(self.camera.position, direction, reach) else {
             return 0;
         };
@@ -652,15 +655,12 @@ impl Running {
             match result {
                 Ok(startup) => {
                     tracing::info!(
-                        "config and {} material textures of {}^2 loaded in {:.1} ms",
+                        "config and {} material layers ({:.1} MB with mips) loaded in {:.1} ms",
                         startup.textures.layer_count(),
-                        startup.textures.size,
+                        startup.textures.bytes() as f64 / 1.0e6,
                         startup.load_ms
                     );
-                    self.renderer.set_material_textures(&MaterialTextures {
-                        size: startup.textures.size,
-                        layers: startup.textures.layers,
-                    });
+                    self.renderer.set_material_textures(&startup.textures);
                     self.replace_world(startup.config);
                     if let Some(km) = args.flight_km {
                         let flight = Flight::new(
@@ -924,7 +924,12 @@ fn spawn_startup(args: &Args, world_path: &std::path::Path, tx: Sender<Result<St
                 let text = std::fs::read_to_string(&world_path)
                     .map_err(|e| format!("reading {}: {e}", world_path.display()))?;
                 let config = parse_config(&text, &args)?;
-                let textures = material_textures(config.seed, MATERIAL_TEXTURE_SIZE);
+                let generated = material_textures(config.seed, MATERIAL_TEXTURE_SIZE);
+                let textures = MaterialTextures {
+                    size: generated.size,
+                    layers: generated.layers,
+                }
+                .prepare()?;
                 Ok(Startup {
                     config,
                     textures,

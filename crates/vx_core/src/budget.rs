@@ -17,12 +17,13 @@ impl Budgets {
     pub const TERRAIN_DRAW_MS: f64 = 6.0;
     /// Generate plus mesh of one 32^3 chunk on one worker.
     pub const CHUNK_GENERATE_MESH_MS: f64 = 4.0;
-    /// Compressed voxel data resident in RAM, apron included.
-    pub const RESIDENT_VOXEL_BYTES: usize = 1536 << 20;
-    /// Terrain vertex and index pools plus material textures in VRAM.
-    pub const GPU_TERRAIN_BYTES: usize = 1536 << 20;
+    /// Compressed voxel data resident in RAM, apron included: 1.5 GB (decimal, as in the design
+    /// document and the overlay).
+    pub const RESIDENT_VOXEL_BYTES: usize = 1_500_000_000;
+    /// Terrain vertex and index pools plus material textures in VRAM: 1.5 GB.
+    pub const GPU_TERRAIN_BYTES: usize = 1_500_000_000;
     /// Mesh bytes copied to the GPU per frame; the upload stage stops for the frame once reached.
-    pub const UPLOAD_BYTES_PER_FRAME: usize = 4 << 20;
+    pub const UPLOAD_BYTES_PER_FRAME: usize = 4_000_000;
     /// Terrain triangles on screen after culling.
     pub const TERRAIN_TRIANGLES_ON_SCREEN: u64 = 3_000_000;
 }

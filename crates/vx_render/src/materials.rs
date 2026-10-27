@@ -2,7 +2,7 @@
 //! sRGB images; the mip chain is generated on the CPU and every level is uploaded, so the GPU
 //! never runs a blit pass for materials.
 
-use crate::MaterialTextures;
+use crate::{MaterialTextures, PreparedMaterialTextures};
 
 /// Size of the built in debug layers.
 const DEBUG_SIZE: u32 = 16;
@@ -59,7 +59,11 @@ impl MaterialArray {
             anisotropy_clamp: 4,
             ..Default::default()
         });
-        let (view, bytes) = upload(device, queue, &debug_textures(), "terrain materials debug");
+        let debug = prepare(&debug_textures()).unwrap_or_else(|e| {
+            // The built in pattern has a fixed valid shape; a failure here is a programming error.
+            panic!("the built in material textures must prepare: {e}")
+        });
+        let (view, bytes) = upload(device, queue, &debug, "terrain materials debug");
         let bind_group = make_bind_group(device, &layout, &view, &sampler);
         Self {
             layout,
@@ -69,14 +73,14 @@ impl MaterialArray {
         }
     }
 
-    /// Replaces the array. On a malformed set the previous array stays bound.
+    /// Replaces the array. On a set the device cannot hold, the previous array stays bound.
     pub(crate) fn set(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        textures: &MaterialTextures,
+        textures: &PreparedMaterialTextures,
     ) -> Result<(), String> {
-        validate(device, textures)?;
+        validate_limits(device, textures)?;
         let (view, bytes) = upload(device, queue, textures, "terrain materials");
         self.bind_group = make_bind_group(device, &self.layout, &view, &self.sampler);
         self.bytes = bytes;
@@ -97,21 +101,48 @@ impl MaterialArray {
     }
 }
 
-fn validate(device: &wgpu::Device, textures: &MaterialTextures) -> Result<(), String> {
+/// Shape checks and the CPU mip chains, without a device, so the work can run on a worker.
+pub(crate) fn prepare(textures: &MaterialTextures) -> Result<PreparedMaterialTextures, String> {
+    profiling::scope!("materials prepare");
+    validate_shape(textures)?;
+    let layers = textures
+        .layers
+        .iter()
+        .map(|base| mip_chain(base, textures.size, textures.size))
+        .collect();
+    Ok(PreparedMaterialTextures {
+        size: textures.size,
+        layers,
+    })
+}
+
+fn validate_limits(
+    device: &wgpu::Device,
+    textures: &PreparedMaterialTextures,
+) -> Result<(), String> {
     let limits = device.limits();
-    if textures.size == 0 || textures.size > limits.max_texture_dimension_2d {
+    if textures.size > limits.max_texture_dimension_2d {
         return Err(format!(
-            "material texture size {} is outside 1 to {}",
+            "material texture size {} is above {}",
             textures.size, limits.max_texture_dimension_2d
         ));
     }
-    if textures.layers.is_empty() || textures.layers.len() as u32 > limits.max_texture_array_layers
-    {
+    if textures.layers.len() as u32 > limits.max_texture_array_layers {
         return Err(format!(
-            "material layer count {} is outside 1 to {}",
+            "material layer count {} is above {}",
             textures.layers.len(),
             limits.max_texture_array_layers
         ));
+    }
+    Ok(())
+}
+
+fn validate_shape(textures: &MaterialTextures) -> Result<(), String> {
+    if textures.size == 0 {
+        return Err("material texture size is 0".into());
+    }
+    if textures.layers.is_empty() {
+        return Err("no material layers".into());
     }
     let expected = (textures.size * textures.size * 4) as usize;
     if let Some((i, layer)) = textures
@@ -156,7 +187,7 @@ fn make_bind_group(
 fn upload(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    textures: &MaterialTextures,
+    textures: &PreparedMaterialTextures,
     label: &str,
 ) -> (wgpu::TextureView, usize) {
     let size = textures.size;
@@ -176,8 +207,8 @@ fn upload(
         view_formats: &[],
     });
     let mut bytes = 0;
-    for (layer, base) in textures.layers.iter().enumerate() {
-        for (level, (width, height, pixels)) in mip_chain(base, size, size).iter().enumerate() {
+    for (layer, chain) in textures.layers.iter().enumerate() {
+        for (level, (width, height, pixels)) in chain.iter().enumerate() {
             bytes += pixels.len();
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {

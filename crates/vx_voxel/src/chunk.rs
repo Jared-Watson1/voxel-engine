@@ -134,8 +134,12 @@ impl Chunk {
     }
 
     /// Frame position of local sample `local` (each coordinate -1 to `CHUNK_SIZE + 1`).
+    ///
+    /// Computed from the integer world sample index with one rounding, so every chunk that stores
+    /// the sample evaluates it at the same f64 position and the apron copies stay bit identical at
+    /// any voxel size (D16).
     pub fn sample_position(&self, local: IVec3) -> DVec3 {
-        self.origin().m + local.as_dvec3() * self.voxel_size_m
+        self.key.world_sample(local).as_dvec3() * self.voxel_size_m
     }
 
     /// Fills every sample, apron included, from a signed distance function of the frame position in
@@ -148,13 +152,12 @@ impl Chunk {
     /// of the solid; samples outside the solid store [`Material::AIR`].
     pub fn fill_from_with_material(&mut self, sample: impl Fn(DVec3) -> (f64, Material)) {
         profiling::scope!("Chunk::fill_from");
-        let base = self.origin().m;
         let inv_voxel = 1.0 / self.voxel_size_m;
         for z in 0..SAMPLES_PER_AXIS {
             for y in 0..SAMPLES_PER_AXIS {
                 for x in 0..SAMPLES_PER_AXIS {
-                    let local = DVec3::new(x as f64, y as f64, z as f64) - DVec3::ONE;
-                    let (distance_m, material) = sample(base + local * self.voxel_size_m);
+                    let local = IVec3::new(x as i32, y as i32, z as i32) - IVec3::ONE;
+                    let (distance_m, material) = sample(self.sample_position(local));
                     let distance = Voxel::quantise_distance(distance_m * inv_voxel);
                     let material = if distance < 0 {
                         material

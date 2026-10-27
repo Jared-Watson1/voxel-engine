@@ -15,8 +15,8 @@ use crate::cull::{CullPass, FLAG_RESIDENT, MAX_SLOTS, frustum_planes};
 use crate::materials::MaterialArray;
 use crate::pool::{Range, RangeAllocator};
 use crate::{
-    CullStats, DEPTH_COMPARE, DEPTH_FORMAT, FrameInput, MATERIAL_TILE_M, MaterialTextures,
-    MeshHandle, PoolError, PoolStats, TerrainPoolConfig,
+    CullStats, DEPTH_COMPARE, DEPTH_FORMAT, FrameInput, MATERIAL_TILE_M, MeshHandle, PoolError,
+    PoolStats, PreparedMaterialTextures, TerrainPoolConfig,
 };
 
 /// Built in copy of `assets/shaders/terrain.wgsl`, so the first frame needs no file I/O. The file
@@ -317,7 +317,7 @@ impl TerrainPass {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        textures: &MaterialTextures,
+        textures: &PreparedMaterialTextures,
     ) {
         profiling::scope!("terrain upload materials");
         if let Err(e) = self.materials.set(device, queue, textures) {

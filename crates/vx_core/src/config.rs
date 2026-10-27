@@ -163,6 +163,11 @@ impl TerrainParams {
             &Self::HEIGHT_RANGE_M,
         )?;
         check(
+            "terrain.grass_depth_m",
+            self.grass_depth_m,
+            &Self::SOIL_DEPTH_RANGE_M,
+        )?;
+        check(
             "terrain.soil_depth_m",
             self.soil_depth_m,
             &Self::SOIL_DEPTH_RANGE_M,
@@ -332,6 +337,8 @@ mod tests {
             "(terrain: (wavelength_m: 1.0))",
             "(terrain: (rock_slope: 0.0))",
             "(terrain: (amplitude_m: -1.0))",
+            "(terrain: (grass_depth_m: -5.0))",
+            "(terrain: (grass_depth_m: 1e300))",
         ] {
             let r = WorldConfig::from_ron_str(text);
             assert!(matches!(r, Err(ConfigError::OutOfRange { .. })), "{text}");

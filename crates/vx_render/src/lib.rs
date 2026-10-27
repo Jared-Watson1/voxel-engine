@@ -78,6 +78,36 @@ pub struct MaterialTextures {
     pub layers: Vec<Vec<u8>>,
 }
 
+impl MaterialTextures {
+    /// Checks the layer shapes and builds every mip level on the CPU (a box filter in linear
+    /// light). Pure CPU work with no device, so it belongs on a worker thread (D9); the renderer
+    /// only copies the result.
+    pub fn prepare(&self) -> Result<PreparedMaterialTextures, String> {
+        materials::prepare(self)
+    }
+}
+
+/// Material layers with their mip chains, ready for [`Renderer::set_material_textures`].
+#[derive(Debug, Clone)]
+pub struct PreparedMaterialTextures {
+    pub(crate) size: u32,
+    /// Per layer, every level as (width, height, RGBA8 sRGB pixels).
+    pub(crate) layers: Vec<Vec<(u32, u32, Vec<u8>)>>,
+}
+
+impl PreparedMaterialTextures {
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flat_map(|levels| levels.iter().map(|(_, _, p)| p.len()))
+            .sum()
+    }
+}
+
 /// Repeat length of the material textures in metres. Triplanar coordinates are chunk local
 /// positions plus [`ChunkDraw::texture_phase_m`], so they are stable as the camera moves without
 /// any world position reaching the shader (D4).
@@ -379,10 +409,11 @@ impl Renderer {
         self.terrain.free_mesh(handle);
     }
 
-    /// Uploads the material texture array with a CPU generated mip chain. Until called, a built
-    /// in debug pattern is used (magenta for layer 0, then grey, brown, green, yellow). A
-    /// malformed set is logged and the previous array stays bound.
-    pub fn set_material_textures(&mut self, textures: &MaterialTextures) {
+    /// Uploads a prepared material texture array (mip chains built by
+    /// [`MaterialTextures::prepare`] off the main thread). Until called, a built in debug pattern
+    /// is used (magenta for layer 0, then grey, brown, green, yellow). A set the device cannot
+    /// hold is logged and the previous array stays bound.
+    pub fn set_material_textures(&mut self, textures: &PreparedMaterialTextures) {
         self.terrain
             .set_material_textures(&self.device, &self.queue, textures);
         let stats = self.terrain.pool_stats();

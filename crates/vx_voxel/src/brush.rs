@@ -80,15 +80,16 @@ impl Brush {
             return false;
         }
 
-        // Same arithmetic as Chunk::sample_position, hoisted out of the loop.
-        let base = chunk.origin().m;
+        // Same arithmetic as Chunk::sample_position (integer world sample index times the voxel
+        // size, one rounding, D16), hoisted out of the loop.
+        let first_sample = chunk.key().world_sample(IVec3::ZERO);
         let samples = chunk.samples_mut();
         let mut changed = false;
         for z in min.z..=max.z {
             for y in min.y..=max.y {
                 for x in min.x..=max.x {
                     let local = IVec3::new(x, y, z);
-                    let p = base + local.as_dvec3() * voxel_size_m;
+                    let p = (first_sample + local).as_dvec3() * voxel_size_m;
                     let brush_voxels = self.signed_distance_m(p) / voxel_size_m;
                     let i = Chunk::linear(stored(x), stored(y), stored(z));
                     let old = samples[i];

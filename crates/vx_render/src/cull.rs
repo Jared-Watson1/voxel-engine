@@ -21,7 +21,9 @@ pub(crate) const CULL_WGSL: &str = include_str!("../../../assets/shaders/terrain
 /// Threads per workgroup of the `cull` entry point; matches `CULL_WORKGROUP_SIZE` in the shader.
 pub(crate) const CULL_WORKGROUP_SIZE: u32 = 64;
 /// Chunk slots addressable by the 16 bits in a packed vertex (D14).
-pub(crate) const MAX_SLOTS: usize = 1 << 16;
+/// One below the u16 range: the compaction pass dispatches one workgroup per visible chunk and
+/// `max_compute_workgroups_per_dimension` is 65535.
+pub(crate) const MAX_SLOTS: usize = (1 << 16) - 1;
 /// `ChunkEntry::flags` bit 0: the slot is resident and listed this frame.
 pub(crate) const FLAG_RESIDENT: u32 = 1;
 

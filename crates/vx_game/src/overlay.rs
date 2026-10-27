@@ -167,7 +167,11 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
                             w.stream_ms_last, w.stream_ms_max
                         ),
                     );
-                    row(ui, "edits", w.edits.to_string());
+                    row(
+                        ui,
+                        "edits",
+                        format!("{} strokes, {} log entries", w.edits, w.edit_log_entries),
+                    );
                 });
             }
 
