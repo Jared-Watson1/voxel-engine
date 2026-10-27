@@ -195,7 +195,13 @@ impl Running {
             .with_title("Voxel Engine")
             .with_inner_size(PhysicalSize::new(args.width, args.height));
         let window = Arc::new(event_loop.create_window(attributes)?);
-        let renderer = Renderer::new(window.clone(), RenderSettings { vsync: args.vsync })?;
+        let renderer = Renderer::new(
+            window.clone(),
+            RenderSettings {
+                vsync: args.vsync,
+                pools: Default::default(),
+            },
+        )?;
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -331,6 +337,11 @@ impl Running {
             self.renderer.render(FrameInput {
                 view_proj: self.camera.view_proj(),
                 mesh_offset_m,
+                chunks: &[],
+                voxel_size_m: self
+                    .chunk
+                    .as_ref()
+                    .map_or(1.0, |c| c.world.voxel_size_m as f32),
                 sun_dir: SUN_DIR.normalize(),
                 ambient: AMBIENT,
                 egui: Some(EguiFrame {
@@ -441,7 +452,7 @@ impl Running {
             );
         }
         if !self.camera_placed {
-            self.place_camera(&result.scene);
+            self.place_camera(&result.scene, result.centre);
         }
         self.chunk = Some(LoadedChunk {
             world: result.world,
@@ -460,9 +471,8 @@ impl Running {
     }
 
     /// Frames the sphere: a three quarter view from above at a few radii, speed scaled to its size.
-    fn place_camera(&mut self, scene: &SceneConfig) {
+    fn place_camera(&mut self, scene: &SceneConfig, centre: WorldPos) {
         let r = scene.sphere_radius_m;
-        let centre = SceneConfig::SPHERE_CENTRE;
         let eye = WorldPos::new(centre.frame, centre.m + DVec3::new(1.4, 1.1, 2.2) * r);
         self.camera = FlyCamera::looking_at(eye, centre.m, r, self.camera.projection);
         self.camera_placed = true;

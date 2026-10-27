@@ -1,25 +1,48 @@
-use glam::DVec3;
-use vx_core::{CHUNK_SIZE, WorldPos};
+use glam::{DVec3, IVec3};
+use vx_core::{CHUNK_SIZE, WorldConfig, WorldPos};
 
-/// Samples along each axis of a chunk: `CHUNK_SIZE` cells need `CHUNK_SIZE + 1` corner samples,
-/// and Transvoxel's central difference gradients reach one sample further on each side, so the
-/// stored range is -1 to `CHUNK_SIZE + 1` inclusive.
+use crate::key::ChunkKey;
+
+/// Samples along each axis of a chunk (D16): `CHUNK_SIZE` cells need `CHUNK_SIZE + 1` corner
+/// samples, and Transvoxel's central difference gradients reach one sample further on each side,
+/// so the stored range is -1 to `CHUNK_SIZE + 1` inclusive.
 pub const SAMPLES_PER_AXIS: usize = CHUNK_SIZE + 3;
 
 /// Quantisation scale of the stored signed distance: one voxel edge equals this many i8 units, so
 /// the representable band is about +-4 voxels around the surface (D2).
 pub const DISTANCE_UNITS_PER_VOXEL: f32 = 32.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Material id. Ids 1 to 15 fit the packed vertex (D14); 0 is air.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Material(pub u8);
 
 impl Material {
     pub const AIR: Self = Self(0);
     pub const ROCK: Self = Self(1);
+    pub const SOIL: Self = Self(2);
+    pub const GRASS: Self = Self(3);
+    pub const SAND: Self = Self(4);
+    /// Largest id the vertex format carries.
+    pub const MAX_ID: u8 = vx_core::mesh::MAX_MATERIAL_ID;
+    /// Number of material ids in use in M1, air included; texture arrays have this many layers.
+    pub const COUNT: usize = 5;
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AIR => "air",
+            Self::ROCK => "rock",
+            Self::SOIL => "soil",
+            Self::GRASS => "grass",
+            Self::SAND => "sand",
+            _ => "unknown",
+        }
+    }
 }
 
 /// One voxel sample: quantised signed distance (negative inside) and a material id (D2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The material of a sample outside the solid is always [`Material::AIR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Voxel {
     pub distance: i8,
     pub material: Material,
@@ -30,6 +53,13 @@ impl Voxel {
         distance: i8::MAX,
         material: Material::AIR,
     };
+
+    pub const fn solid(material: Material) -> Self {
+        Self {
+            distance: -i8::MAX,
+            material,
+        }
+    }
 
     /// Quantises a signed distance given in voxels.
     ///
@@ -50,49 +80,84 @@ impl Voxel {
     pub fn is_inside(self) -> bool {
         self.distance < 0
     }
+
+    /// Packs the pair into one u16 (distance in the low byte), the palette key in [`crate::ChunkStore`].
+    pub fn to_u16(self) -> u16 {
+        u16::from(self.distance as u8) | (u16::from(self.material.0) << 8)
+    }
+
+    pub fn from_u16(v: u16) -> Self {
+        Self {
+            distance: (v & 0xFF) as u8 as i8,
+            material: Material((v >> 8) as u8),
+        }
+    }
 }
 
-/// A dense `SAMPLES_PER_AXIS`^3 block of voxels whose sample (0, 0, 0) sits at `origin`.
+/// A dense `SAMPLES_PER_AXIS`^3 block of voxels for chunk `key`: the working form for
+/// generation, brushes and meshing. The resident form is [`crate::ChunkStore`].
 ///
 /// Sample spacing is `voxel_size_m` from the world config (D11), never a literal.
+#[derive(Clone)]
 pub struct Chunk {
-    origin: WorldPos,
+    key: ChunkKey,
     voxel_size_m: f64,
     voxels: Box<[Voxel]>,
 }
 
 impl Chunk {
-    pub fn new(origin: WorldPos, voxel_size_m: f64) -> Self {
+    pub fn new(key: ChunkKey, voxel_size_m: f64) -> Self {
         assert!(voxel_size_m > 0.0, "voxel size must be positive");
         Self {
-            origin,
+            key,
             voxel_size_m,
             voxels: vec![Voxel::AIR; SAMPLES_PER_AXIS.pow(3)].into_boxed_slice(),
         }
     }
 
+    pub fn for_key(key: ChunkKey, config: &WorldConfig) -> Self {
+        Self::new(key, config.voxel_size_m)
+    }
+
+    pub fn key(&self) -> ChunkKey {
+        self.key
+    }
+
+    /// Position of local sample (0, 0, 0) in the body fixed frame.
     pub fn origin(&self) -> WorldPos {
-        self.origin
+        let extent = CHUNK_SIZE as f64 * self.voxel_size_m;
+        WorldPos::body_fixed(self.key.as_ivec3().as_dvec3() * extent)
     }
 
     pub fn voxel_size_m(&self) -> f64 {
         self.voxel_size_m
     }
 
+    /// Frame position of local sample `local` (each coordinate -1 to `CHUNK_SIZE + 1`).
+    pub fn sample_position(&self, local: IVec3) -> DVec3 {
+        self.origin().m + local.as_dvec3() * self.voxel_size_m
+    }
+
     /// Fills every sample, apron included, from a signed distance function of the frame position in
     /// metres (negative inside). Material is rock inside and air outside.
     pub fn fill_from(&mut self, sdf: impl Fn(DVec3) -> f64) {
+        self.fill_from_with_material(|p| (sdf(p), Material::ROCK));
+    }
+
+    /// Fills every sample from a function returning the signed distance in metres and the material
+    /// of the solid; samples outside the solid store [`Material::AIR`].
+    pub fn fill_from_with_material(&mut self, sample: impl Fn(DVec3) -> (f64, Material)) {
         profiling::scope!("Chunk::fill_from");
-        let base = self.origin.m;
+        let base = self.origin().m;
         let inv_voxel = 1.0 / self.voxel_size_m;
         for z in 0..SAMPLES_PER_AXIS {
             for y in 0..SAMPLES_PER_AXIS {
                 for x in 0..SAMPLES_PER_AXIS {
                     let local = DVec3::new(x as f64, y as f64, z as f64) - DVec3::ONE;
-                    let distance_m = sdf(base + local * self.voxel_size_m);
+                    let (distance_m, material) = sample(base + local * self.voxel_size_m);
                     let distance = Voxel::quantise_distance(distance_m * inv_voxel);
                     let material = if distance < 0 {
-                        Material::ROCK
+                        material
                     } else {
                         Material::AIR
                     };
@@ -102,21 +167,65 @@ impl Chunk {
         }
     }
 
-    /// Sample at grid coordinates in -1 to `CHUNK_SIZE + 1` inclusive.
-    pub fn get(&self, x: isize, y: isize, z: isize) -> Voxel {
-        let offset = |v: isize| {
-            let i = v + 1;
-            debug_assert!(
-                (0..SAMPLES_PER_AXIS as isize).contains(&i),
-                "sample {v} outside apron"
-            );
-            i as usize
-        };
-        self.voxels[Self::linear(offset(x), offset(y), offset(z))]
+    /// Sets every sample to `voxel`.
+    pub fn fill_uniform(&mut self, voxel: Voxel) {
+        self.voxels.fill(voxel);
     }
 
-    fn linear(x: usize, y: usize, z: usize) -> usize {
+    /// Sample at grid coordinates in -1 to `CHUNK_SIZE + 1` inclusive.
+    pub fn get(&self, x: isize, y: isize, z: isize) -> Voxel {
+        self.voxels[Self::linear(Self::offset(x), Self::offset(y), Self::offset(z))]
+    }
+
+    pub fn set(&mut self, x: isize, y: isize, z: isize, voxel: Voxel) {
+        self.voxels[Self::linear(Self::offset(x), Self::offset(y), Self::offset(z))] = voxel;
+    }
+
+    /// All samples in x fastest, then y, then z order; index with [`Chunk::linear`].
+    pub fn samples(&self) -> &[Voxel] {
+        &self.voxels
+    }
+
+    pub fn samples_mut(&mut self) -> &mut [Voxel] {
+        &mut self.voxels
+    }
+
+    /// The single value every sample holds, if the chunk is uniform.
+    pub fn uniform_value(&self) -> Option<Voxel> {
+        let first = self.voxels[0];
+        self.voxels.iter().all(|v| *v == first).then_some(first)
+    }
+
+    /// True when the block holds both inside and outside samples, so meshing can produce triangles.
+    pub fn has_surface(&self) -> bool {
+        let mut inside = false;
+        let mut outside = false;
+        for v in self.voxels.iter() {
+            if v.is_inside() {
+                inside = true;
+            } else {
+                outside = true;
+            }
+            if inside && outside {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Index into [`Chunk::samples`] of stored coordinates 0 to `SAMPLES_PER_AXIS - 1` (stored
+    /// coordinate = local coordinate + 1).
+    pub fn linear(x: usize, y: usize, z: usize) -> usize {
         (z * SAMPLES_PER_AXIS + y) * SAMPLES_PER_AXIS + x
+    }
+
+    fn offset(v: isize) -> usize {
+        let i = v + 1;
+        debug_assert!(
+            (0..SAMPLES_PER_AXIS as isize).contains(&i),
+            "sample {v} outside apron"
+        );
+        i as usize
     }
 }
 
@@ -152,16 +261,46 @@ mod tests {
     }
 
     #[test]
+    fn voxel_u16_round_trips() {
+        for v in [
+            Voxel::AIR,
+            Voxel::solid(Material::SAND),
+            Voxel {
+                distance: -3,
+                material: Material::GRASS,
+            },
+        ] {
+            assert_eq!(Voxel::from_u16(v.to_u16()), v);
+        }
+    }
+
+    #[test]
     fn samples_are_spaced_by_the_voxel_size() {
         for voxel_size_m in [0.25, 1.0, 4.0] {
-            let origin = WorldPos::body_fixed(DVec3::new(100.0, -50.0, 3.0));
-            let mut chunk = Chunk::new(origin, voxel_size_m);
+            let key = ChunkKey::new(3, -2, 7);
+            let mut chunk = Chunk::new(key, voxel_size_m);
+            let origin_y = chunk.origin().m.y;
+            assert_eq!(origin_y, -2.0 * 32.0 * voxel_size_m);
             // A plane whose signed distance is the height above the chunk origin in metres.
-            chunk.fill_from(|p| p.y - origin.m.y - 2.0 * voxel_size_m);
+            chunk.fill_from(|p| p.y - origin_y - 2.0 * voxel_size_m);
             assert!(chunk.get(5, 1, 5).is_inside());
             assert!(!chunk.get(5, 3, 5).is_inside());
             assert_eq!(chunk.get(0, -1, 0).distance_voxels(), -3.0);
             assert_eq!(chunk.get(0, CHUNK_SIZE as isize + 1, 0).distance, i8::MAX);
+            assert!(chunk.has_surface());
+            assert!(chunk.uniform_value().is_none());
         }
+    }
+
+    #[test]
+    fn uniform_and_surface_detection() {
+        let mut chunk = Chunk::new(ChunkKey::new(0, 0, 0), 1.0);
+        assert_eq!(chunk.uniform_value(), Some(Voxel::AIR));
+        assert!(!chunk.has_surface());
+        chunk.fill_uniform(Voxel::solid(Material::ROCK));
+        assert_eq!(chunk.uniform_value(), Some(Voxel::solid(Material::ROCK)));
+        assert!(!chunk.has_surface());
+        chunk.set(4, 4, 4, Voxel::AIR);
+        assert!(chunk.has_surface());
     }
 }

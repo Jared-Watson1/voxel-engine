@@ -667,6 +667,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastnoise-lite"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e5f3c3cc9081e5d0e18bcd50e80cd33cba47fc22f88a9da9c33ecd1c87ea5c0"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "fax"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3053,11 +3062,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vx_core"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "glam",
  "notify",
  "ron",
  "serde",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -3098,6 +3109,7 @@ dependencies = [
  "profiling",
  "thiserror 2.0.21",
  "tracing",
+ "vx_core",
  "wgpu",
  "winit",
 ]
@@ -3116,6 +3128,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "profiling",
+ "thiserror 2.0.21",
  "transvoxel",
  "vx_core",
 ]
@@ -3123,6 +3136,13 @@ dependencies = [
 [[package]]
 name = "vx_worldgen"
 version = "0.1.0"
+dependencies = [
+ "fastnoise-lite",
+ "glam",
+ "profiling",
+ "vx_core",
+ "vx_voxel",
+]
 
 [[package]]
 name = "walkdir"

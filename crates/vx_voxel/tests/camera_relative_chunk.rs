@@ -3,16 +3,21 @@
 
 use glam::{DVec3, Vec3};
 use vx_core::{Projection, WorldConfig, WorldPos, camera_relative};
-use vx_voxel::{Chunk, mesh_regular};
+use vx_voxel::{Chunk, ChunkKey, mesh_regular};
 
 #[test]
 fn chunk_at_a_billion_metres_projects_without_precision_loss() {
     let config = WorldConfig::default();
     let extent_m = config.chunk_extent_m();
-    let origin = WorldPos::body_fixed(DVec3::new(1.0e9, 2.0e8, -7.0e8));
+    // Key (31250000, 6250000, -21875000) puts the chunk origin at (1e9, 2e8, -7e8) m at 1 m voxels.
+    let mut chunk = Chunk::new(
+        ChunkKey::new(31_250_000, 6_250_000, -21_875_000),
+        config.voxel_size_m,
+    );
+    let origin = chunk.origin();
+    assert_eq!(origin.m, DVec3::new(1.0e9, 2.0e8, -7.0e8));
     let centre = origin.m + DVec3::splat(0.5 * extent_m);
     let radius_m = 0.3 * extent_m;
-    let mut chunk = Chunk::new(origin, config.voxel_size_m);
     chunk.fill_from(|p| p.distance(centre) - radius_m);
     let mesh = mesh_regular(&chunk);
     assert!(!mesh.is_empty());

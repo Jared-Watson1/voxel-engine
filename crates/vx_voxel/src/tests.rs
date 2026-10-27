@@ -4,9 +4,9 @@
 use std::collections::{HashMap, HashSet};
 
 use glam::{DVec3, Vec3};
-use vx_core::{CHUNK_SIZE, WorldConfig, WorldPos};
+use vx_core::{CHUNK_SIZE, WorldConfig};
 
-use crate::{Chunk, ChunkMesh, mesh_regular};
+use crate::{Chunk, ChunkKey, ChunkMesh, mesh_regular};
 
 /// Radius as a fraction of the chunk extent; keeps the sphere inside the cell region (not touching
 /// the apron) at every voxel size.
@@ -21,11 +21,11 @@ struct SphereCase {
 
 fn sphere_case(voxel_size_m: f64) -> SphereCase {
     let extent_m = CHUNK_SIZE as f64 * voxel_size_m;
-    // An origin far from the frame origin so the test also covers f64 sampling there.
-    let origin = WorldPos::body_fixed(DVec3::new(1.0e6, -2.0e5, 3.0e4));
+    // A key far from the frame origin so the test also covers f64 sampling there.
+    let mut chunk = Chunk::new(ChunkKey::new(31_250, -6_250, 937), voxel_size_m);
+    let origin = chunk.origin();
     let centre = origin.m + DVec3::splat(0.5 * extent_m);
     let radius_m = SPHERE_RADIUS_CHUNK_FRACTION * extent_m;
-    let mut chunk = Chunk::new(origin, voxel_size_m);
     chunk.fill_from(|p| p.distance(centre) - radius_m);
     SphereCase {
         centre_local_m: (centre - origin.m).as_vec3(),
@@ -152,11 +152,11 @@ fn voxel_size_only_scales_the_mesh() {
 
 #[test]
 fn uniform_chunks_produce_no_triangles() {
-    let origin = WorldPos::default();
-    let mut air = Chunk::new(origin, 1.0);
+    let key = ChunkKey::new(0, 0, 0);
+    let mut air = Chunk::new(key, 1.0);
     air.fill_from(|_| 10.0);
     assert!(mesh_regular(&air).is_empty());
-    let mut rock = Chunk::new(origin, 1.0);
+    let mut rock = Chunk::new(key, 1.0);
     rock.fill_from(|_| -10.0);
     assert!(mesh_regular(&rock).is_empty());
 }

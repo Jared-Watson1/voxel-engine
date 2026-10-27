@@ -1,6 +1,37 @@
 // World scale parameters (D11). Values here are the design defaults the performance budgets are
-// measured at; see WorldConfig in crates/vx_core/src/config.rs for each supported range.
+// measured at; see WorldConfig and TerrainParams in crates/vx_core/src/config.rs for each
+// supported range. Missing fields take the design default.
 (
     // Edge length of one voxel in metres. Design default 1.0, supported 0.25 to 4.0.
     voxel_size_m: 1.0,
+    // World seed (D5): every generated value is a pure function of position and this seed.
+    seed: 1,
+    // Radius in chunks of the sphere of chunks streamed around the camera (512 m at 1 m voxels).
+    // Supported 2 to 48.
+    view_radius_chunks: 16,
+    // Chunks beyond view_radius_chunks + stream_hysteresis_chunks are evicted. Supported 0 to 8.
+    stream_hysteresis_chunks: 2,
+    // The M1 flat world's terrain, +Y up, all lengths in metres.
+    terrain: (
+        // Mean surface height. Supported -2000 to 2000.
+        base_height_m: 0.0,
+        // Largest deviation of the heightfield from the base height. Supported 0 to 2000.
+        amplitude_m: 96.0,
+        // Wavelength of the largest heightfield feature. Supported 16 to 100000.
+        wavelength_m: 1024.0,
+        // Heightfield fractal octaves. Supported 1 to 12.
+        octaves: 6,
+        // Amplitude of the 3D detail noise added to the signed distance. Supported 0 to 64.
+        detail_amplitude_m: 3.0,
+        // Wavelength of the 3D detail noise. Supported 1 to 1000.
+        detail_wavelength_m: 40.0,
+        // Surfaces below this height are sand. Supported -2000 to 2000.
+        sand_below_m: -6.0,
+        // Thickness of the grass (or sand) layer at the surface. Supported 0 to 64.
+        grass_depth_m: 1.5,
+        // Depth below the surface at which soil gives way to rock. Supported 0 to 64.
+        soil_depth_m: 4.0,
+        // Slopes steeper than this (rise over run) are bare rock. Supported 0.1 to 10.
+        rock_slope: 1.0,
+    ),
 )

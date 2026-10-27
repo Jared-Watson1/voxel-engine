@@ -5,9 +5,49 @@ use transvoxel::structs::voxel_index::VoxelIndex;
 use transvoxel::traits::mesh_builder::MeshBuilder;
 use transvoxel::traits::voxel_block::VoxelBlock;
 use transvoxel::traits::voxel_data::Density;
-use vx_core::{CHUNK_SIZE, WorldPos};
+use vx_core::{CHUNK_SIZE, PackedVertex, WorldPos};
 
 use crate::chunk::Chunk;
+use crate::key::ChunkKey;
+
+/// Packed, indexed triangle mesh of one chunk (D14): positions quantised in chunk local voxel
+/// units, octahedral normals, material slots. Indices are local to the mesh (0 based). Counter
+/// clockwise front faces seen from outside the solid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedMesh {
+    pub key: ChunkKey,
+    pub vertices: Vec<PackedVertex>,
+    pub indices: Vec<u32>,
+}
+
+impl PackedMesh {
+    pub fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn vertex_bytes(&self) -> usize {
+        self.vertices.len() * std::mem::size_of::<PackedVertex>()
+    }
+
+    pub fn index_bytes(&self) -> usize {
+        self.indices.len() * std::mem::size_of::<u32>()
+    }
+}
+
+/// Meshes the chunk's `CHUNK_SIZE`^3 cells with Transvoxel regular cells into packed vertices.
+///
+/// Vertex positions, normals and material slots depend only on the edge that produced the vertex
+/// and the solid endpoint's face neighbours, never on the owning cell, so a vertex on a chunk face
+/// is identical in both chunks that share the face (D14, D15, engineering rule 6). The chunk slot
+/// word is left zero for the renderer to patch.
+pub fn mesh_chunk(chunk: &Chunk) -> PackedMesh {
+    let _ = chunk;
+    todo!("workstream D")
+}
 
 /// Indexed triangle mesh of one chunk in chunk local metres (relative to [`ChunkMesh::origin`]),
 /// counter clockwise front faces seen from outside the solid.

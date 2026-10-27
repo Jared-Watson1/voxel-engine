@@ -1,7 +1,12 @@
 //! Device, surface, passes and pipelines.
 //!
-//! The renderer receives meshes in local coordinates and camera relative parameters only; no world
-//! position ever reaches it (D4). It never depends on generation or physics crates.
+//! The renderer receives packed meshes in chunk local coordinates and camera relative parameters
+//! only; no world position ever reaches it (D4). It never depends on the voxel, generation or
+//! physics crates.
+//!
+//! Terrain (D10, D19): meshes live in pooled vertex and index buffers ([`Renderer::upload_mesh`]),
+//! a compute pass culls every resident chunk against the frustum and compacts the visible indices,
+//! and one indexed indirect draw renders them with vertex pulling and triplanar materials.
 
 mod capture;
 mod terrain;
@@ -9,10 +14,111 @@ mod terrain;
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
+use vx_core::{Budgets, PackedVertex};
 use winit::window::Window;
 
 pub use capture::CapturedImage;
 pub use terrain::FrameUniform;
+
+/// Sizes of the pooled terrain buffers. The sum, plus material textures, stays under
+/// [`Budgets::GPU_TERRAIN_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainPoolConfig {
+    pub vertex_bytes: usize,
+    pub index_bytes: usize,
+}
+
+impl Default for TerrainPoolConfig {
+    /// 256 MiB of vertices (16 M packed vertices) and 128 MiB of indices: about 5,000 surface
+    /// chunks of 3,000 vertices at the design defaults, with room for the compacted index copy.
+    fn default() -> Self {
+        Self {
+            vertex_bytes: 256 << 20,
+            index_bytes: 128 << 20,
+        }
+    }
+}
+
+impl TerrainPoolConfig {
+    /// Bytes the pools and the compacted index copy occupy on the GPU.
+    pub fn gpu_bytes(&self) -> usize {
+        self.vertex_bytes + 2 * self.index_bytes
+    }
+}
+
+const _: () = assert!(
+    (256 << 20) + 2 * (128 << 20) <= Budgets::GPU_TERRAIN_BYTES,
+    "default pools exceed the GPU terrain budget"
+);
+
+/// A resident chunk mesh: the slot in the GPU chunk table, which the packed vertices carry (D14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MeshHandle(pub u16);
+
+#[derive(Debug, thiserror::Error)]
+pub enum PoolError {
+    #[error("vertex pool full: {needed} bytes needed, largest free range {largest_free} bytes")]
+    VertexPoolFull { needed: usize, largest_free: usize },
+    #[error("index pool full: {needed} bytes needed, largest free range {largest_free} bytes")]
+    IndexPoolFull { needed: usize, largest_free: usize },
+    #[error("no free chunk slot (65536 resident meshes)")]
+    NoFreeSlot,
+    #[error("an empty mesh cannot be uploaded")]
+    EmptyMesh,
+}
+
+/// Material albedo layers for the texture array: RGBA8 sRGB, `size` by `size`, layer index equal
+/// to the material id.
+#[derive(Debug, Clone)]
+pub struct MaterialTextures {
+    pub size: u32,
+    pub layers: Vec<Vec<u8>>,
+}
+
+/// Repeat length of the material textures in metres. Triplanar coordinates are chunk local
+/// positions plus [`ChunkDraw::texture_phase_m`], so they are stable as the camera moves without
+/// any world position reaching the shader (D4).
+pub const MATERIAL_TILE_M: f64 = 4.0;
+
+/// One resident chunk to draw this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChunkDraw {
+    pub handle: MeshHandle,
+    /// Camera relative position of the chunk origin in metres, computed in f64 by the caller.
+    pub offset_m: Vec3,
+    /// Chunk origin modulo [`MATERIAL_TILE_M`] along each axis (0 to the tile length), computed in
+    /// f64 by the caller, so texture coordinates do not depend on the camera.
+    pub texture_phase_m: Vec3,
+}
+
+/// Pool occupancy for the overlay and the GPU budget check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PoolStats {
+    pub vertex_bytes_used: usize,
+    pub vertex_bytes_capacity: usize,
+    pub index_bytes_used: usize,
+    pub index_bytes_capacity: usize,
+    /// Largest allocatable range in each pool, which shows fragmentation.
+    pub largest_free_vertex_bytes: usize,
+    pub largest_free_index_bytes: usize,
+    pub meshes: usize,
+    /// Material textures and other fixed terrain resources.
+    pub texture_bytes: usize,
+}
+
+impl PoolStats {
+    pub fn gpu_bytes(&self) -> usize {
+        self.vertex_bytes_capacity + 2 * self.index_bytes_capacity + self.texture_bytes
+    }
+}
+
+/// Culling results read back from the GPU; `frames_old` says how stale they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CullStats {
+    pub visible_chunks: u32,
+    pub triangles: u32,
+    pub frames_old: u32,
+}
 
 /// Depth format for every 3D pass: 32 bit float with reverse-Z (D4).
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -37,6 +143,7 @@ pub enum RenderError {
 pub struct RenderSettings {
     /// Wait for vertical blank. Off gives uncapped frame times for measurements.
     pub vsync: bool,
+    pub pools: TerrainPoolConfig,
 }
 
 /// A triangle mesh in metres relative to its own origin, counter clockwise front faces.
@@ -58,8 +165,13 @@ pub struct EguiFrame<'a> {
 pub struct FrameInput<'a> {
     /// Projection times the rotation only view matrix.
     pub view_proj: Mat4,
-    /// Camera relative position of the mesh origin, computed in f64 by the caller.
+    /// Camera relative position of the mesh origin, computed in f64 by the caller (M0 path,
+    /// removed when the pooled path lands).
     pub mesh_offset_m: Vec3,
+    /// Every resident chunk with its camera relative offset; the compute pass culls them.
+    pub chunks: &'a [ChunkDraw],
+    /// Scales packed vertex positions (1/1024 voxel units) to metres.
+    pub voxel_size_m: f32,
     /// Unit direction towards the sun in frame axes.
     pub sun_dir: Vec3,
     pub ambient: f32,
@@ -226,9 +338,43 @@ impl Renderer {
         self.depth_view = create_depth_view(&self.device, width, height);
     }
 
-    /// Replaces the terrain mesh. An empty mesh clears it.
+    /// Replaces the terrain mesh. An empty mesh clears it. M0 path, removed by workstream E.
     pub fn set_mesh(&mut self, mesh: &MeshData) {
         self.terrain.set_mesh(&self.device, mesh);
+    }
+
+    /// Copies a packed mesh into the pools and returns its chunk slot. The slot is written into
+    /// every vertex's fourth word before the copy (D14). Indices are mesh local. Fails without
+    /// side effects when a pool or the slot table is full.
+    pub fn upload_mesh(
+        &mut self,
+        vertices: &[PackedVertex],
+        indices: &[u32],
+    ) -> Result<MeshHandle, PoolError> {
+        let _ = (vertices, indices);
+        todo!("workstream E")
+    }
+
+    /// Releases the mesh's pool ranges and slot. Safe to call in the same frame as a draw that
+    /// listed the handle; the renderer drops it from that frame's chunk table.
+    pub fn free_mesh(&mut self, handle: MeshHandle) {
+        let _ = handle;
+        todo!("workstream E")
+    }
+
+    /// Uploads the material texture array. Until called, a built in debug pattern is used.
+    pub fn set_material_textures(&mut self, textures: &MaterialTextures) {
+        let _ = textures;
+        todo!("workstream E")
+    }
+
+    pub fn pool_stats(&self) -> PoolStats {
+        todo!("workstream E")
+    }
+
+    /// Latest culling results, read back without blocking; `None` until the first readback.
+    pub fn cull_stats(&self) -> Option<CullStats> {
+        todo!("workstream E")
     }
 
     /// Compiles new terrain shader source. On any error the previous pipeline stays in use and the

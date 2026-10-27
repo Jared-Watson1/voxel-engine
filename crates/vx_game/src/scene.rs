@@ -8,7 +8,7 @@ use std::time::Instant;
 use glam::DVec3;
 use serde::Deserialize;
 use vx_core::{WorldConfig, WorldPos};
-use vx_voxel::{Chunk, ChunkMesh, mesh_regular};
+use vx_voxel::{Chunk, ChunkKey, ChunkMesh, mesh_regular};
 
 /// Scene parameters for the M0 test sphere, loaded from `assets/config/m0_scene.ron`.
 ///
@@ -31,8 +31,8 @@ impl Default for SceneConfig {
 }
 
 impl SceneConfig {
-    /// Sphere centre in the body fixed frame; the chunk is placed around it.
-    pub const SPHERE_CENTRE: WorldPos = WorldPos::body_fixed(DVec3::ZERO);
+    /// The chunk holding the sphere; the sphere sits at its centre.
+    pub const CHUNK_KEY: ChunkKey = ChunkKey::new(0, 0, 0);
 
     fn parse(text: &str) -> Result<Self, String> {
         let config: Self = ron::from_str(text).map_err(|e| e.to_string())?;
@@ -56,6 +56,8 @@ pub struct ChunkResult {
     pub world: WorldConfig,
     pub scene: SceneConfig,
     pub mesh: ChunkMesh,
+    /// Sphere centre in the body fixed frame.
+    pub centre: WorldPos,
     pub generate_ms: f64,
     pub mesh_ms: f64,
     /// False when the sphere is larger than the chunk at this voxel size, so the mesh is clipped
@@ -101,12 +103,12 @@ fn build_chunk(
     let scene = SceneConfig::parse(&scene_text)?;
 
     let extent_m = world.chunk_extent_m();
-    let centre = SceneConfig::SPHERE_CENTRE;
-    let origin = WorldPos::new(centre.frame, centre.m - DVec3::splat(0.5 * extent_m));
     let radius_m = scene.sphere_radius_m;
 
     let start = Instant::now();
-    let mut chunk = Chunk::new(origin, world.voxel_size_m);
+    let mut chunk = Chunk::new(SceneConfig::CHUNK_KEY, world.voxel_size_m);
+    let origin = chunk.origin();
+    let centre = WorldPos::new(origin.frame, origin.m + DVec3::splat(0.5 * extent_m));
     chunk.fill_from(|p| p.distance(centre.m) - radius_m);
     let generated = Instant::now();
     let mesh = mesh_regular(&chunk);
@@ -117,6 +119,7 @@ fn build_chunk(
         world,
         scene,
         mesh,
+        centre,
         generate_ms: (generated - start).as_secs_f64() * 1.0e3,
         mesh_ms: (meshed - generated).as_secs_f64() * 1.0e3,
         sphere_fits: 2.0 * radius_m < extent_m,
