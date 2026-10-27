@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 pub struct Budgets;
 
 impl Budgets {
-    /// Whole frame at 60 fps.
-    pub const FRAME_MS: f64 = 16.6;
+    /// Whole frame at 60 fps: one 60 Hz period (16.667 ms) rounded up, so a vsync locked frame
+    /// is within budget rather than reported at 100.4 percent.
+    pub const FRAME_MS: f64 = 16.7;
     /// Main thread work per frame: scheduling, streaming bookkeeping, uploads and egui.
     pub const MAIN_THREAD_MS: f64 = 3.0;
     /// GPU time for the terrain pass.
