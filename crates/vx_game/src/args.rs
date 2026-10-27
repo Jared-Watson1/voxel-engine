@@ -23,6 +23,10 @@ pub struct Args {
     pub flight_speed_m_s: f64,
     /// Apply a scripted dig or place every few frames during the measurement.
     pub edit_test: bool,
+    /// Brush radius in voxels at startup.
+    pub brush_radius_voxels: Option<f64>,
+    /// Hide the debug overlay (for screenshots of the terrain alone).
+    pub no_overlay: bool,
     /// Save a screenshot here after warm up (after the benchmark when both are given) and exit.
     pub screenshot: Option<PathBuf>,
 }
@@ -44,6 +48,8 @@ OPTIONS:
     --flight-km <km>        fly a square loop of this side during the measurement
     --flight-speed <m/s>    flight speed (default 100)
     --edit-test             apply scripted brushes during the measurement
+    --brush-radius <voxels> brush radius at startup (default 3)
+    --no-overlay            hide the debug overlay
     --screenshot <path>     save a PNG after warm up (and after any benchmark), exit
     -h, --help              print this help
 
@@ -74,6 +80,8 @@ impl Args {
             flight_km: None,
             flight_speed_m_s: 100.0,
             edit_test: false,
+            brush_radius_voxels: None,
+            no_overlay: false,
             screenshot: None,
         };
         while let Some(flag) = it.next() {
@@ -96,6 +104,8 @@ impl Args {
                 "--flight-km" => args.flight_km = Some(value()?.parse()?),
                 "--flight-speed" => args.flight_speed_m_s = value()?.parse()?,
                 "--edit-test" => args.edit_test = true,
+                "--brush-radius" => args.brush_radius_voxels = Some(value()?.parse()?),
+                "--no-overlay" => args.no_overlay = true,
                 "--screenshot" => args.screenshot = Some(PathBuf::from(value()?)),
                 other => bail!("unknown option {other}\n\n{USAGE}"),
             }
@@ -119,7 +129,8 @@ mod tests {
     fn parses_measurement_flags() {
         let a = parse(
             "--voxel-size 0.5 --no-vsync --size 1280x720 --bench-seconds 10 --screenshot a.png \
-             --flight-km 2 --flight-speed 50 --edit-test --view-radius 8 --seed 7 --workers 3",
+             --flight-km 2 --flight-speed 50 --edit-test --view-radius 8 --seed 7 --workers 3 \
+             --brush-radius 6 --no-overlay",
         )
         .unwrap()
         .unwrap();
@@ -134,6 +145,8 @@ mod tests {
         assert_eq!(a.view_radius_chunks, Some(8));
         assert_eq!(a.seed, Some(7));
         assert_eq!(a.workers, Some(3));
+        assert_eq!(a.brush_radius_voxels, Some(6.0));
+        assert!(a.no_overlay);
         assert!(a.automated());
     }
 

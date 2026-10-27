@@ -243,7 +243,7 @@ impl Running {
                 ..
             } if !response.consumed => {
                 let op = self.brush.op;
-                self.apply_brush_along_view(op);
+                self.apply_brush_along_view(op, 0.0);
             }
             WindowEvent::MouseWheel { delta, .. } if !response.consumed => {
                 let lines = match delta {
@@ -343,7 +343,10 @@ impl Running {
             draws: Vec::new(),
             brush: BrushSettings {
                 op: BrushOp::Dig,
-                radius_voxels: BRUSH_RADIUS_VOXELS,
+                radius_voxels: args
+                    .brush_radius_voxels
+                    .unwrap_or(BRUSH_RADIUS_VOXELS)
+                    .clamp(BRUSH_RADIUS_MIN_VOXELS, BRUSH_RADIUS_MAX_VOXELS),
             },
             flight: None,
             budget_monitor: BudgetMonitor::new(),
@@ -386,12 +389,14 @@ impl Running {
 
     /// Picks the surface along the view direction and applies the brush there. A dig is centred
     /// on the hit; a place is pulled back by half a radius so the blob sits on the surface.
-    fn apply_brush_along_view(&mut self, op: BrushOp) -> usize {
+    /// `side_offset_radii` shifts the centre along the camera's right axis in brush radii.
+    fn apply_brush_along_view(&mut self, op: BrushOp, side_offset_radii: f64) -> usize {
         let Some(world) = &mut self.world else {
             return 0;
         };
         let config = *world.config();
         let direction = self.camera.orientation() * DVec3::NEG_Z;
+        let right = self.camera.orientation() * DVec3::X;
         let reach = BRUSH_REACH_CHUNKS * config.chunk_extent_m();
         let Some(hit) = world.raycast(self.camera.position, direction, reach) else {
             return 0;
@@ -400,7 +405,7 @@ impl Running {
         let centre = match op {
             BrushOp::Dig => hit,
             BrushOp::Place(_) => hit - direction * (0.5 * radius_m),
-        };
+        } + right * (side_offset_radii * radius_m);
         let brush = Brush {
             shape: BrushShape::Sphere {
                 centre: WorldPos::body_fixed(centre),
@@ -443,10 +448,14 @@ impl Running {
         let egui_start = Instant::now();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let overlay_data = self.overlay_data(args);
+        let show_overlay = !args.no_overlay;
         let full_output = {
             profiling::scope!("egui");
-            self.egui_ctx
-                .run_pass(raw_input, |ctx| overlay::draw(ctx, &overlay_data))
+            self.egui_ctx.run_pass(raw_input, |ctx| {
+                if show_overlay {
+                    overlay::draw(ctx, &overlay_data);
+                }
+            })
         };
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -545,12 +554,13 @@ impl Running {
         {
             return;
         }
-        let op = if (self.frame_index / EDIT_TEST_INTERVAL_FRAMES).is_multiple_of(2) {
-            BrushOp::Dig
+        // Three digs deepen a crater, then one place builds a rock pile two radii to the right.
+        let (op, side) = if (self.frame_index / EDIT_TEST_INTERVAL_FRAMES).is_multiple_of(4) {
+            (BrushOp::Place(Material::ROCK), 2.0)
         } else {
-            BrushOp::Place(Material::ROCK)
+            (BrushOp::Dig, 0.0)
         };
-        if self.apply_brush_along_view(op) > 0 {
+        if self.apply_brush_along_view(op, side) > 0 {
             self.peaks.edits += 1;
         }
     }
@@ -786,6 +796,9 @@ impl Running {
                     self.automation = if args.bench_seconds.is_some() || self.flight.is_some() {
                         self.bench_samples.clear();
                         self.peaks = BenchPeaks::default();
+                        if let Some(world) = &mut self.world {
+                            world.reset_peaks();
+                        }
                         Automation::Measuring {
                             since: Instant::now(),
                         }

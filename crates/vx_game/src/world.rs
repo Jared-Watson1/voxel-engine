@@ -575,6 +575,16 @@ impl World {
         changed
     }
 
+    /// Clears the peak values so a measurement window reports only its own peaks.
+    pub fn reset_peaks(&mut self) {
+        let s = &mut self.stats;
+        s.upload_bytes_peak = 0;
+        s.voxel_bytes_peak = s.voxel_bytes;
+        s.stream_ms_max = 0.0;
+        s.update_ms_max = 0.0;
+        s.queued_peak = 0;
+    }
+
     /// Frees every GPU mesh; called before the world is dropped so the pools are returned.
     pub fn release(&mut self, renderer: &mut Renderer) {
         let keys: Vec<ChunkKey> = self.slots.keys().copied().collect();
