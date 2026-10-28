@@ -688,3 +688,47 @@ fn planet_fill_timing() {
         );
     }
 }
+
+/// The constants every early out rests on, checked over a fine grid of fractions: the 1D weights'
+/// magnitudes sum to at most 5/4, the tensor product's negative weights to at most 9/32, and the
+/// 1D derivative, written over the three node differences, has coefficients whose magnitudes sum
+/// to at most 3/2.
+#[test]
+fn catmull_rom_bounds_hold() {
+    let steps = 1000;
+    let mut weight_sum = 0.0f64;
+    let mut negative_2d = 0.0f64;
+    let mut difference_sum = 0.0f64;
+    for a in 0..=steps {
+        let s = f64::from(a) / f64::from(steps);
+        let (ws, dws) = catmull_rom_weights(s);
+        assert!((ws.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(dws.iter().sum::<f64>().abs() < 1e-12);
+        weight_sum = weight_sum.max(ws.iter().map(|w| w.abs()).sum());
+        // f' = sum dws_i n_i = sum_k c_k (n_{k+1} - n_k) with c_k = -(dws_0 + ... + dws_k).
+        let c0 = -dws[0];
+        let c1 = -(dws[0] + dws[1]);
+        let c2 = -(dws[0] + dws[1] + dws[2]);
+        difference_sum = difference_sum.max(c0.abs() + c1.abs() + c2.abs());
+        for b in (0..=steps).step_by(10) {
+            let t = f64::from(b) / f64::from(steps);
+            let (wt, _) = catmull_rom_weights(t);
+            let negative: f64 = ws
+                .iter()
+                .flat_map(|x| wt.iter().map(move |y| x * y))
+                .filter(|w| *w < 0.0)
+                .map(f64::abs)
+                .sum();
+            negative_2d = negative_2d.max(negative);
+        }
+    }
+    println!(
+        "Catmull-Rom: weight magnitude sum {weight_sum:.6}, 2D negative sum {negative_2d:.6}, derivative coefficients {difference_sum:.6}"
+    );
+    assert!(weight_sum <= 1.25 + 1e-12);
+    assert!(negative_2d <= CATMULL_ROM_OVERSHOOT + 1e-12);
+    assert!(difference_sum <= 1.5 + 1e-12);
+    assert!(CATMULL_ROM_SLOPE_PER_DIFFERENCE >= difference_sum * weight_sum - 1e-12);
+    // The bounds are reached (at s = t = 1/2), so they are tight as well as sound.
+    assert!(negative_2d > CATMULL_ROM_OVERSHOOT - 1e-9 && difference_sum > 1.5 - 1e-9);
+}

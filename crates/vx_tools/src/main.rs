@@ -99,6 +99,9 @@ struct Samples {
     mesh: Vec<f64>,
     total: Vec<f64>,
     triangles: Vec<usize>,
+    /// Height grid nodes computed for the chunk and its slabs (cache misses times tile nodes): a
+    /// load independent measure of the cold cost.
+    nodes: Vec<u64>,
 }
 
 fn bench_chunk(options: &Options) -> Result<(), String> {
@@ -116,6 +119,11 @@ fn bench_chunk(options: &Options) -> Result<(), String> {
     }
     planet.validate().map_err(|e| e.to_string())?;
     let sampler = PlanetSampler::new(config.seed, &planet, config.voxel_size_m);
+    let load = std::process::Command::new("uptime")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    println!("machine: {load}");
     let levels: Vec<u8> = options.level.map_or(vec![0, 3, 6], |l| vec![l]);
     let runs = options.runs.max(1);
 
@@ -191,6 +199,7 @@ fn bench_chunk(options: &Options) -> Result<(), String> {
 
 fn measure(sampler: &PlanetSampler, config: &WorldConfig, key: ChunkKey, out: &mut Samples) {
     let mut chunk = Chunk::for_key(key, config);
+    let misses = sampler.height_cache_stats().misses;
     let t0 = Instant::now();
     sampler.fill_chunk(&mut chunk);
     let t1 = Instant::now();
@@ -208,6 +217,9 @@ fn measure(sampler: &PlanetSampler, config: &WorldConfig, key: ChunkKey, out: &m
     out.mesh.push(ms(t3 - t2));
     out.total.push(ms(t3 - t0));
     out.triangles.push(mesh.triangle_count());
+    let stats = sampler.height_cache_stats();
+    out.nodes
+        .push((stats.misses - misses) * stats.tile_nodes as u64);
 }
 
 fn report(planet: &PlanetParams, config: &WorldConfig, level: u8, cache: &str, s: &mut Samples) {
@@ -225,11 +237,13 @@ fn report(planet: &PlanetParams, config: &WorldConfig, level: u8, cache: &str, s
     row("mesh", &mut s.mesh);
     row("total", &mut s.total);
     let triangles = s.triangles.iter().sum::<usize>() as f64 / s.triangles.len() as f64;
+    let nodes = s.nodes.iter().sum::<u64>() as f64 / s.nodes.len() as f64;
+    println!("  {cache} nodes computed per chunk, slabs included: {nodes:.0} mean");
     println!(
         "BENCH-CHUNK radius_km={} voxel_size_m={} seed={} level={level} cache={cache} \
          generate_ms_p50={:.3} generate_ms_p95={:.3} slabs_ms_p50={:.3} slabs_ms_p95={:.3} \
          mesh_ms_p50={:.3} mesh_ms_p95={:.3} total_ms_p50={:.3} total_ms_p95={:.3} \
-         triangles_mean={triangles:.0} budget_ms={}",
+         triangles_mean={triangles:.0} nodes_mean={nodes:.0} budget_ms={}",
         planet.radius_km,
         config.voxel_size_m,
         config.seed,

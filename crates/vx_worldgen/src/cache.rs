@@ -51,6 +51,8 @@ pub struct HeightCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub resident_bytes: usize,
+    /// Nodes per tile: `misses * tile_nodes` is the number of nodes computed.
+    pub tile_nodes: usize,
 }
 
 struct Slot {
@@ -131,6 +133,7 @@ impl TileCache {
     pub(crate) fn stats(&self) -> HeightCacheStats {
         let mut stats = HeightCacheStats {
             capacity_tiles: self.ways * self.shards.len(),
+            tile_nodes: TILE_NODES,
             ..HeightCacheStats::default()
         };
         for shard in self.shards.iter() {
