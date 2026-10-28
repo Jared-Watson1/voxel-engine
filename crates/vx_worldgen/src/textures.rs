@@ -13,6 +13,8 @@ const OCTAVE_GAIN: f64 = 0.5;
 const TINT_OCTAVES: usize = 3;
 /// Ridge value (0 to 1) above which a rock vein darkens the surface.
 const VEIN_THRESHOLD: f64 = 0.82;
+/// Edge of a mosaic cell in texels.
+const MOSAIC_CELL_PX: u32 = 4;
 /// Debug colour of the air layer, never visible on a correct mesh.
 const AIR_RGBA: [u8; 4] = [255, 0, 255, 255];
 
@@ -59,39 +61,56 @@ struct Recipe {
     tint: [f64; 3],
     /// Amplitude of the finest lattice, equal on all channels (grain).
     speckle: f64,
+    /// Amplitude of the mosaic: one flat value per `MOSAIC_CELL_PX` square with hard edges, the
+    /// crisp block face detail of the art direction.
+    mosaic: f64,
     /// Darkening along the ridges of a third fractal (rock veins); zero disables it.
     veins: f64,
 }
 
+/// Albedo recipes after the Lay of the Land art direction (design document, Art direction): lush
+/// saturated grass, pale cream grey limestone, warm brown soil, light sand and bright snow.
 fn recipe(material: Material) -> Recipe {
     match material {
         Material::SOIL => Recipe {
-            base: [110.0, 78.0, 52.0],
-            variation: [18.0, 13.0, 9.0],
-            tint: [18.0, 12.0, 6.0],
-            speckle: 6.0,
+            base: [128.0, 88.0, 56.0],
+            variation: [16.0, 12.0, 8.0],
+            tint: [16.0, 10.0, 4.0],
+            speckle: 5.0,
+            mosaic: 10.0,
             veins: 0.0,
         },
         Material::GRASS => Recipe {
-            base: [66.0, 108.0, 44.0],
-            variation: [10.0, 14.0, 7.0],
-            tint: [50.0, 26.0, -10.0],
+            base: [80.0, 146.0, 44.0],
+            variation: [10.0, 16.0, 6.0],
+            tint: [34.0, 18.0, -8.0],
             speckle: 4.0,
+            mosaic: 12.0,
             veins: 0.0,
         },
         Material::SAND => Recipe {
-            base: [152.0, 136.0, 100.0],
-            variation: [10.0, 9.0, 7.0],
-            tint: [10.0, 6.0, -2.0],
+            base: [214.0, 198.0, 152.0],
+            variation: [8.0, 8.0, 7.0],
+            tint: [8.0, 5.0, -2.0],
             speckle: 4.0,
+            mosaic: 6.0,
+            veins: 0.0,
+        },
+        Material::SNOW => Recipe {
+            base: [232.0, 237.0, 244.0],
+            variation: [5.0, 5.0, 4.0],
+            tint: [-6.0, -3.0, 2.0],
+            speckle: 3.0,
+            mosaic: 4.0,
             veins: 0.0,
         },
         _ => Recipe {
-            base: [116.0, 114.0, 110.0],
-            variation: [24.0, 24.0, 24.0],
-            tint: [16.0, 9.0, 2.0],
+            base: [190.0, 184.0, 166.0],
+            variation: [14.0, 14.0, 13.0],
+            tint: [10.0, 7.0, 2.0],
             speckle: 5.0,
-            veins: 40.0,
+            mosaic: 12.0,
+            veins: 34.0,
         },
     }
 }
@@ -108,6 +127,14 @@ fn layer(texture_seed: u64, size: u32, material: Material) -> Vec<u8> {
     let veins = (recipe.veins > 0.0)
         .then(|| PeriodicFbm::new(splitmix64(layer_seed ^ 0x33), size, usize::MAX));
     let speckle = PeriodicLattice::new(splitmix64(layer_seed ^ 0x44), (size / 2).max(1));
+    // Tiny layers (debug sizes) skip the mosaic: a few cells across would dominate the image.
+    let mosaic_period = size / MOSAIC_CELL_PX;
+    let mosaic_amplitude = if mosaic_period >= 8 {
+        recipe.mosaic
+    } else {
+        0.0
+    };
+    let mosaic = PeriodicLattice::new(splitmix64(layer_seed ^ 0x55), mosaic_period.max(1));
     let size_f = f64::from(size);
 
     let mut out = Vec::with_capacity(texels * 4);
@@ -116,6 +143,7 @@ fn layer(texture_seed: u64, size: u32, material: Material) -> Vec<u8> {
             let v = variation.at_texel(x, y);
             let t = tint.at_texel(x, y) * 0.5 + 0.5;
             let s = speckle.at_texel(x, y, size_f);
+            let m = mosaic.at_cell(x, y, size_f);
             let dark = veins.as_ref().map_or(0.0, |veins| {
                 let ridge = 1.0 - veins.at_texel(x, y).abs();
                 let mask = ((ridge - VEIN_THRESHOLD) / (1.0 - VEIN_THRESHOLD)).clamp(0.0, 1.0);
@@ -124,7 +152,9 @@ fn layer(texture_seed: u64, size: u32, material: Material) -> Vec<u8> {
             for ((base, variation), tint) in
                 recipe.base.iter().zip(&recipe.variation).zip(&recipe.tint)
             {
-                let value = base + variation * v + tint * t + recipe.speckle * s - dark;
+                let value =
+                    base + variation * v + tint * t + recipe.speckle * s + mosaic_amplitude * m
+                        - dark;
                 out.push(value.round().clamp(0.0, 255.0) as u8);
             }
             out.push(255);
@@ -155,6 +185,15 @@ impl PeriodicLattice {
     fn at_texel(&self, x: u32, y: u32, size: f64) -> f64 {
         let period = f64::from(self.period);
         self.sample(f64::from(x) * period / size, f64::from(y) * period / size)
+    }
+
+    /// Value of the lattice cell holding texel `(x, y)`, without interpolation: hard edged
+    /// squares.
+    fn at_cell(&self, x: u32, y: u32, size: f64) -> f64 {
+        let period = f64::from(self.period);
+        let i = ((f64::from(x) * period / size).floor() as u32).min(self.period - 1);
+        let j = ((f64::from(y) * period / size).floor() as u32).min(self.period - 1);
+        self.values[(j * self.period + i) as usize]
     }
 
     /// Value at lattice coordinates `(u, v)` in cells, both at least zero.
@@ -273,6 +312,44 @@ mod tests {
         ]
     }
 
+    /// Mean luminance per material after the art direction: soil darkest, then grass, pale
+    /// limestone, light sand and bright snow.
+    fn expected_luminance(material: Material) -> std::ops::RangeInclusive<f64> {
+        match material {
+            Material::SOIL => 0.3..=0.45,
+            Material::GRASS => 0.42..=0.6,
+            Material::ROCK => 0.62..=0.8,
+            Material::SAND => 0.7..=0.85,
+            Material::SNOW => 0.85..=0.97,
+            _ => 0.0..=1.0,
+        }
+    }
+
+    #[test]
+    fn grass_is_saturated_and_rock_is_pale() {
+        let set = material_textures(1, 64);
+        let mean = |id: Material| {
+            let layer = &set.layers[usize::from(id.0)];
+            let mut sum = [0.0f64; 3];
+            for px in layer.chunks_exact(4) {
+                for c in 0..3 {
+                    sum[c] += f64::from(px[c]);
+                }
+            }
+            sum.map(|v| v / (layer.len() / 4) as f64)
+        };
+        let grass = mean(Material::GRASS);
+        assert!(
+            grass[1] > 1.5 * grass[0] && grass[1] > 2.5 * grass[2],
+            "{grass:?}"
+        );
+        let rock = mean(Material::ROCK);
+        let spread = rock.iter().cloned().fold(f64::MIN, f64::max)
+            - rock.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(spread < 30.0 && rock[0] > rock[2], "{rock:?}");
+        assert_eq!(set.layer_count(), 6, "air, rock, soil, grass, sand, snow");
+    }
+
     fn mean_luminance(layer: &[u8]) -> f64 {
         let texels = layer.len() / 4;
         let sum: f64 = layer
@@ -315,9 +392,10 @@ mod tests {
                 }
                 if id > 0 {
                     let luminance = mean_luminance(layer);
+                    let expected = expected_luminance(Material(id as u8));
                     assert!(
-                        (0.3..=0.6).contains(&luminance),
-                        "layer {id} size {size} mean luminance {luminance}"
+                        expected.contains(&luminance),
+                        "layer {id} size {size} mean luminance {luminance}, expected {expected:?}"
                     );
                     if size >= 64 {
                         let (min, max) = layer

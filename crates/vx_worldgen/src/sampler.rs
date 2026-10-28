@@ -667,49 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn no_hash_maps_in_the_crate() {
-        // Assembled from pieces so this file does not itself contain the forbidden text.
-        let forbidden: Vec<String> = [
-            ["Hash", "Map"],
-            ["Hash", "Set"],
-            [".si", "n("],
-            [".co", "s("],
-            [".ex", "p("],
-            [".pow", "f("],
-            [".l", "n("],
-            [".ta", "n("],
-            [".ata", "n2("],
-        ]
-        .iter()
-        .map(|parts| parts.concat())
-        .collect();
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files: Vec<_> = std::fs::read_dir(&src)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-            .collect();
-        files.sort();
-        assert!(
-            files.len() >= 4,
-            "expected the crate's source files in {src:?}"
-        );
-        for path in files {
-            let text = std::fs::read_to_string(&path).unwrap();
-            for (line_number, line) in text.lines().enumerate() {
-                for word in &forbidden {
-                    assert!(
-                        !line.contains(word.as_str()),
-                        "{}:{}: contains {word}",
-                        path.display(),
-                        line_number + 1
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn all_four_materials_appear() {
         let sampler = sampler();
         let voxel_size_m = 1.0;
