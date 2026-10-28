@@ -7,13 +7,14 @@ use crate::{MaterialTextures, PreparedMaterialTextures};
 /// Size of the built in debug layers.
 const DEBUG_SIZE: u32 = 16;
 /// Debug colours by layer: magenta for 0 (air, never a surface material), then grey, brown,
-/// green and yellow, each with a faint checker so the tile repeat is visible.
-const DEBUG_COLOURS: [[u8; 3]; 5] = [
+/// green, yellow and white (snow), each with a faint checker so the tile repeat is visible.
+const DEBUG_COLOURS: [[u8; 3]; 6] = [
     [255, 0, 255],
     [128, 128, 128],
     [120, 80, 50],
     [70, 130, 50],
     [200, 180, 60],
+    [240, 240, 245],
 ];
 
 pub(crate) struct MaterialArray {
