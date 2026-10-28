@@ -173,7 +173,7 @@ impl World {
             lod,
             nodes: HashMap::new(),
             edits: Arc::new(Vec::new()),
-            origin: camera,
+            origin: (camera / config.voxel_size_m).round() * config.voxel_size_m,
             next_generation: 1,
             tx,
             rx,
@@ -210,7 +210,17 @@ impl World {
     /// Moves the render origin without the rebase threshold, for placing the camera before any
     /// mesh exists; resident meshes keep their old placements until the next rebase.
     pub fn set_origin(&mut self, origin: DVec3) {
-        self.origin = origin;
+        self.origin = self.snap_to_voxel_grid(origin);
+    }
+
+    /// The render origin sits on the level 0 voxel grid, so every chunk offset is a whole number
+    /// of voxels and exact in f32 (under 2^24 voxels), and `local * voxel_size + offset` is exact
+    /// for vertices within 16,384 voxel sizes of their level. Two chunks that share a vertex then
+    /// compute the same f32 position on the GPU whatever their levels (rule 6), as long as the
+    /// voxel size is a power of two (0.25 to 4 m, the design range's powers of two).
+    fn snap_to_voxel_grid(&self, p: DVec3) -> DVec3 {
+        let v = self.config.voxel_size_m;
+        (p / v).round() * v
     }
 
     /// Height of `position` above the terrain under it (full detail height, no edits).
@@ -281,7 +291,7 @@ impl World {
             return;
         }
         let start = Instant::now();
-        self.origin = camera;
+        self.origin = self.snap_to_voxel_grid(camera);
         for (&key, node) in &self.nodes {
             if let Some(handle) = node.mesh {
                 renderer.set_placement(handle, self.placement(key, node));
