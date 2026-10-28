@@ -1,23 +1,30 @@
 //! Device, surface, passes and pipelines.
 //!
-//! The renderer receives packed meshes in chunk local coordinates and camera relative parameters
-//! only; no world position ever reaches it (D4). It never depends on the voxel, generation or
-//! physics crates.
+//! The renderer receives packed meshes in chunk local coordinates and positions relative to a
+//! floating render origin or to the camera only; no world position ever reaches it (D4, D23). It
+//! never depends on the voxel, generation or physics crates.
 //!
-//! Terrain (D10, D19): meshes live in pooled vertex and index buffers ([`Renderer::upload_mesh`]),
-//! a compute pass culls every resident chunk against the frustum and compacts the visible indices,
-//! and one indexed indirect draw renders them with vertex pulling and triplanar materials.
+//! Terrain (D10, D19, D22, D23): meshes live in pooled vertex and index buffers
+//! ([`Renderer::upload_mesh`]) with a persistent chunk table of placements relative to the render
+//! origin; a compute pass culls every resident chunk and compacts the visible indices, including
+//! the transition ranges of masked faces, and one indexed indirect draw renders them into a
+//! G-buffer. Lighting and the sky (D25): the atmosphere LUTs, one fullscreen lighting pass into an
+//! HDR target and a tonemap pass into the swapchain, with egui on top.
+//!
+//! Frame order: cull, terrain G-buffer, atmosphere LUTs, lighting, tonemap, egui.
 
+mod atmosphere;
 mod capture;
 mod cull;
 mod materials;
 mod pool;
+mod post;
 mod terrain;
 
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
-use vx_core::{Budgets, PackedVertex};
+use vx_core::{AtmosphereParams, Budgets, PackedVertex};
 use winit::window::Window;
 
 pub use capture::CapturedImage;
@@ -109,19 +116,105 @@ impl PreparedMaterialTextures {
 }
 
 /// Repeat length of the material textures in metres. Triplanar coordinates are chunk local
-/// positions plus [`ChunkDraw::texture_phase_m`], so they are stable as the camera moves without
-/// any world position reaching the shader (D4).
+/// positions plus [`ChunkPlacement::texture_phase_m`], so they are stable as the camera moves
+/// without any world position reaching the shader (D4).
 pub const MATERIAL_TILE_M: f64 = 4.0;
 
-/// One resident chunk to draw this frame.
+/// A packed chunk mesh to upload. `indices` holds the regular range followed by the six
+/// transition ranges in face order (low x, high x, low y, high y, low z, high z), with these
+/// counts (D22); the counts sum to `indices.len()`.
+#[derive(Debug, Clone, Copy)]
+pub struct MeshUpload<'a> {
+    pub vertices: &'a [PackedVertex],
+    pub indices: &'a [u32],
+    pub regular_index_count: u32,
+    pub transition_index_counts: [u32; 6],
+}
+
+/// Where and how a resident chunk draws (D23). Written into the chunk table at upload and again
+/// only when it changes: on a rebase of the render origin, a transition mask change or a
+/// visibility change.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChunkDraw {
-    pub handle: MeshHandle,
-    /// Camera relative position of the chunk origin in metres, computed in f64 by the caller.
+pub struct ChunkPlacement {
+    /// Chunk origin relative to the render origin in metres, computed in f64 by the caller.
     pub offset_m: Vec3,
     /// Chunk origin modulo [`MATERIAL_TILE_M`] along each axis (0 to the tile length), computed in
-    /// f64 by the caller, so texture coordinates do not depend on the camera.
+    /// f64 by the caller, so texture coordinates do not depend on the camera or the origin.
     pub texture_phase_m: Vec3,
+    /// Sample spacing of the chunk's level; scales the packed positions.
+    pub voxel_size_m: f32,
+    /// Bit `face` set when the neighbour across that face is drawn one level finer: the vertex
+    /// shader moves vertices to their secondary positions and the face's transition range draws.
+    pub transition_mask: u8,
+    /// Hidden chunks stay resident but are skipped by the cull pass.
+    pub visible: bool,
+}
+
+/// The planet as the GPU needs it, relative to the camera.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanetView {
+    /// Planet centre relative to the camera in metres (body fixed axes).
+    pub centre_m: Vec3,
+    /// Mean radius in metres; the atmosphere's ground.
+    pub radius_m: f32,
+    /// Radius of a sphere the terrain never dips below, for the horizon test in the cull pass.
+    pub occluder_radius_m: f32,
+}
+
+/// The star's light at the planet, above the atmosphere.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunLight {
+    /// Unit direction towards the sun in body fixed axes.
+    pub direction: Vec3,
+    /// Illuminance above the atmosphere in the renderer's linear units (1.0 is the Sun at 1 AU),
+    /// per colour channel.
+    pub illuminance: Vec3,
+    /// Angular radius of the disc.
+    pub angular_radius_rad: f32,
+}
+
+/// A moon drawn by the sky pass as a lit sphere (stretch in M2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoonLight {
+    /// Moon centre relative to the camera in metres (body fixed axes).
+    pub centre_m: Vec3,
+    pub radius_m: f32,
+    pub albedo: f32,
+}
+
+impl Default for PlanetView {
+    fn default() -> Self {
+        Self {
+            centre_m: Vec3::new(0.0, -10_000.0, 0.0),
+            radius_m: 10_000.0,
+            occluder_radius_m: 9_000.0,
+        }
+    }
+}
+
+impl Default for SunLight {
+    fn default() -> Self {
+        Self {
+            direction: Vec3::new(0.3, 0.8, 0.5).normalize(),
+            illuminance: Vec3::ONE,
+            angular_radius_rad: 0.004_65,
+        }
+    }
+}
+
+/// GPU time per pass from timestamp queries, read back a few frames late; `None` from
+/// [`Renderer::gpu_timings`] when the adapter has no timestamp queries.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpuTimings {
+    /// Pass name and milliseconds, in frame order.
+    pub passes: Vec<(&'static str, f64)>,
+    pub frames_old: u32,
+}
+
+impl GpuTimings {
+    pub fn total_ms(&self) -> f64 {
+        self.passes.iter().map(|(_, ms)| ms).sum()
+    }
 }
 
 /// Pool occupancy for the overlay and the GPU budget check.
@@ -155,6 +248,20 @@ pub struct CullStats {
 
 /// Depth format for every 3D pass: 32 bit float with reverse-Z (D4).
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// G-buffer albedo: linear albedo stored as sRGB, alpha 1 where terrain was drawn (D25).
+pub const GBUFFER_ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// G-buffer normal: unit normal in body fixed axes in xyz, w reserved (0).
+pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Lit scene radiance before tonemapping.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Every shader file the renderer compiles, for hot reload through [`Renderer::reload_shader`].
+pub const SHADER_FILES: [&str; 5] = [
+    "terrain.wgsl",
+    "terrain_cull.wgsl",
+    "atmosphere.wgsl",
+    "lighting.wgsl",
+    "tonemap.wgsl",
+];
 /// Depth clear value for reverse-Z: 0.0 is infinitely far.
 pub const DEPTH_CLEAR: f32 = 0.0;
 /// Depth test for reverse-Z: nearer fragments have greater depth.
@@ -191,17 +298,17 @@ pub struct EguiFrame<'a> {
     pub pixels_per_point: f32,
 }
 
-/// Everything the renderer needs for one frame, all camera relative.
+/// Everything the renderer needs for one frame besides the persistent chunk table (D23).
 pub struct FrameInput<'a> {
-    /// Projection times the rotation only view matrix.
+    /// Projection times the rotation only view matrix (body fixed axes to clip space).
     pub view_proj: Mat4,
-    /// Every resident chunk with its camera relative offset; the compute pass culls them.
-    pub chunks: &'a [ChunkDraw],
-    /// Scales packed vertex positions (1/1024 voxel units) to metres.
-    pub voxel_size_m: f32,
-    /// Unit direction towards the sun in frame axes.
-    pub sun_dir: Vec3,
-    pub ambient: f32,
+    /// Camera position relative to the render origin in metres, within the rebase distance.
+    pub camera_offset_m: Vec3,
+    pub planet: PlanetView,
+    pub sun: SunLight,
+    pub moon: Option<MoonLight>,
+    /// Exposure in stops applied before the tonemap curve.
+    pub exposure_ev: f32,
     pub egui: Option<EguiFrame<'a>>,
 }
 
@@ -239,8 +346,10 @@ pub struct Renderer {
     /// Set when the last image was suboptimal; the surface cannot be reconfigured while an image
     /// is held, so it happens before the next acquire.
     reconfigure: bool,
-    depth_view: wgpu::TextureView,
+    targets: FrameTargets,
     terrain: terrain::TerrainPass,
+    atmosphere: atmosphere::AtmospherePass,
+    post: post::PostPass,
     egui: egui_wgpu::Renderer,
     capture: capture::Capture,
     info: GpuInfo,
@@ -353,8 +462,10 @@ impl Renderer {
             info.present_mode
         );
 
-        let depth_view = create_depth_view(&device, config.width, config.height);
-        let terrain = terrain::TerrainPass::new(&device, &queue, scene_format, settings.pools);
+        let targets = FrameTargets::new(&device, config.width, config.height);
+        let terrain = terrain::TerrainPass::new(&device, &queue, settings.pools);
+        let atmosphere = atmosphere::AtmospherePass::new(&device, &queue);
+        let post = post::PostPass::new(&device, scene_format);
         let egui = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let capture = capture::Capture::new(usage.contains(wgpu::TextureUsages::COPY_SRC));
 
@@ -365,8 +476,10 @@ impl Renderer {
             config,
             scene_format,
             reconfigure: false,
-            depth_view,
+            targets,
             terrain,
+            atmosphere,
+            post,
             egui,
             capture,
             info,
@@ -388,25 +501,40 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, width, height);
+        self.targets = FrameTargets::new(&self.device, width, height);
     }
 
-    /// Copies a packed mesh into the pools and returns its chunk slot. The slot is written into
-    /// every vertex's fourth word before the copy (D14). Indices are mesh local. Fails without
-    /// side effects when a pool or the slot table is full.
+    /// Copies a packed mesh into the pools, writes its chunk table entry and returns its chunk
+    /// slot. The slot is written into every vertex's fourth word before the copy (D14). Indices
+    /// are mesh local. Fails without side effects when a pool or the slot table is full.
     pub fn upload_mesh(
         &mut self,
-        vertices: &[PackedVertex],
-        indices: &[u32],
+        mesh: &MeshUpload,
+        placement: ChunkPlacement,
     ) -> Result<MeshHandle, PoolError> {
-        self.terrain.upload_mesh(&self.queue, vertices, indices)
+        self.terrain.upload_mesh(&self.queue, mesh, placement)
     }
 
-    /// Releases the mesh's pool ranges and slot. Safe to call in the same frame as a draw that
-    /// listed the handle; the renderer drops it from that frame's chunk table. The slot may be
-    /// handed to the next upload, so a stale handle listed after that draws the new mesh.
+    /// Replaces a resident chunk's placement; the table entry is rewritten before the next frame.
+    pub fn set_placement(&mut self, handle: MeshHandle, placement: ChunkPlacement) {
+        self.terrain.set_placement(handle, placement);
+    }
+
+    /// Releases the mesh's pool ranges and slot; it is not drawn from the next frame on. The slot
+    /// may be handed to the next upload.
     pub fn free_mesh(&mut self, handle: MeshHandle) {
         self.terrain.free_mesh(handle);
+    }
+
+    /// Sets the planet's atmosphere (D25); the static LUTs are recomputed before the next frame.
+    pub fn set_atmosphere(&mut self, atmosphere: &AtmosphereParams, planet_radius_m: f64) {
+        self.atmosphere.set_params(atmosphere, planet_radius_m);
+    }
+
+    /// GPU time per pass, or `None` when the adapter has no timestamp queries or no readback has
+    /// completed yet.
+    pub fn gpu_timings(&self) -> Option<GpuTimings> {
+        None
     }
 
     /// Uploads a prepared material texture array (mip chains built by
@@ -437,16 +565,18 @@ impl Renderer {
         self.terrain.cull_stats()
     }
 
-    /// Compiles new terrain shader source (`assets/shaders/terrain.wgsl`). On any error the
-    /// previous pipeline stays in use and the error is returned for logging (engineering rule 9).
-    pub fn reload_terrain_shader(&mut self, source: &str) -> Result<(), String> {
-        self.terrain.reload(&self.device, self.scene_format, source)
-    }
-
-    /// Compiles new culling shader source (`assets/shaders/terrain_cull.wgsl`) for both compute
-    /// entry points. On any error both previous pipelines stay in use.
-    pub fn reload_cull_shader(&mut self, source: &str) -> Result<(), String> {
-        self.terrain.reload_cull(&self.device, source)
+    /// Compiles new source for one of [`SHADER_FILES`] (a file name under `assets/shaders/`). On
+    /// any error every previous pipeline built from that file stays in use and the error is
+    /// returned for logging (engineering rule 9).
+    pub fn reload_shader(&mut self, file: &str, source: &str) -> Result<(), String> {
+        match file {
+            "terrain.wgsl" => self.terrain.reload(&self.device, source),
+            "terrain_cull.wgsl" => self.terrain.reload_cull(&self.device, source),
+            "atmosphere.wgsl" => self.atmosphere.reload_luts(&self.device, source),
+            "lighting.wgsl" => self.atmosphere.reload_lighting(&self.device, source),
+            "tonemap.wgsl" => self.post.reload(&self.device, source),
+            other => Err(format!("{other} is not a renderer shader")),
+        }
     }
 
     /// Copies the next presented frame, egui included, for [`Renderer::poll_capture`].
@@ -528,6 +658,8 @@ impl Renderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.terrain.prepare_frame(&self.device, &self.queue, frame);
+        self.atmosphere.prepare_frame(&self.queue, frame);
+        self.post.prepare_frame(&self.queue, frame);
 
         let mut encoder = self
             .device
@@ -538,24 +670,28 @@ impl Renderer {
 
         {
             profiling::scope!("terrain pass");
+            let clear = wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terrain"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &scene_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.018,
-                            g: 0.022,
-                            b: 0.032,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.albedo,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: clear,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.targets.normal,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: clear,
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
+                    view: &self.targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
                         store: wgpu::StoreOp::Store,
@@ -569,6 +705,11 @@ impl Renderer {
             self.terrain.draw(&mut pass);
         }
         self.terrain.encode_readback(&mut encoder);
+        self.atmosphere.encode_luts(&mut encoder);
+        self.atmosphere
+            .encode_lighting(&self.device, &mut encoder, &self.targets);
+        self.post
+            .encode_tonemap(&self.device, &mut encoder, &self.targets.hdr, &scene_view);
 
         let mut extra_buffers = Vec::new();
         if let Some(ui) = &frame.egui {
@@ -621,21 +762,41 @@ impl Renderer {
     }
 }
 
-fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-    device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        })
-        .create_view(&wgpu::TextureViewDescriptor::default())
+/// The screen sized textures every frame renders through: the G-buffer, depth and the HDR target.
+/// Recreated on resize.
+pub(crate) struct FrameTargets {
+    pub(crate) albedo: wgpu::TextureView,
+    pub(crate) normal: wgpu::TextureView,
+    pub(crate) depth: wgpu::TextureView,
+    pub(crate) hdr: wgpu::TextureView,
+}
+
+impl FrameTargets {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let view = |label, format| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        Self {
+            albedo: view("gbuffer albedo", GBUFFER_ALBEDO_FORMAT),
+            normal: view("gbuffer normal", GBUFFER_NORMAL_FORMAT),
+            depth: view("depth", DEPTH_FORMAT),
+            hdr: view("hdr", HDR_FORMAT),
+        }
+    }
 }

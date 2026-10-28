@@ -11,17 +11,24 @@ use transvoxel::traits::voxel_data::{Density, VoxelData};
 use vx_core::mesh::{MATERIAL_SLOTS, MAX_MATERIAL_WEIGHT};
 use vx_core::{CHUNK_SIZE, PackedVertex, VertexAttributes};
 
+use crate::block::SampleBlock;
 use crate::chunk::{Chunk, Material, Voxel};
 use crate::key::ChunkKey;
 
 /// Packed, indexed triangle mesh of one chunk (D14): positions quantised in chunk local voxel
 /// units, octahedral normals, material slots. Indices are local to the mesh (0 based). Counter
 /// clockwise front faces seen from outside the solid.
+///
+/// Indices are laid out as the regular cells first (`regular_index_count`), then the transition
+/// cells of each face in [`crate::Face`] order (`transition_index_counts`, D22); the renderer draws
+/// a face's range only while that face's mask bit is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedMesh {
     pub key: ChunkKey,
     pub vertices: Vec<PackedVertex>,
     pub indices: Vec<u32>,
+    pub regular_index_count: u32,
+    pub transition_index_counts: [u32; 6],
 }
 
 impl PackedMesh {
@@ -73,9 +80,24 @@ pub fn mesh_chunk(chunk: &Chunk) -> PackedMesh {
     let builder = extract(&blocks, SURFACE_DENSITY, PackedBuilder::new(chunk));
     PackedMesh {
         key: chunk.key(),
+        regular_index_count: builder.indices.len() as u32,
+        transition_index_counts: [0; 6],
         vertices: builder.vertices,
         indices: builder.indices,
     }
+}
+
+/// Meshes the chunk's regular cells unshrunk plus, for every face whose slab is given, that
+/// face's transition cells from the slab's fine samples into their own index range (D22). Slabs
+/// come from [`crate::transition_slab`] filled by the sampler and the edit log. Transition vertices
+/// on the full resolution face carry [`vx_core::mesh::FLAG_TRANSITION_FULL_RES`]; vertices on the
+/// half resolution face equal the regular vertex on the same edge bit for bit. Without slabs the
+/// result equals [`mesh_chunk`].
+pub fn mesh_chunk_lod(chunk: &Chunk, slabs: &[Option<SampleBlock>; 6]) -> PackedMesh {
+    if slabs.iter().all(Option::is_none) {
+        return mesh_chunk(chunk);
+    }
+    todo!("workstream D: vendored transition cell extraction")
 }
 
 /// The crate treats density above the threshold as inside, so it receives the negated distance.

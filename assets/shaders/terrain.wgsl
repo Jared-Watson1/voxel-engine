@@ -1,6 +1,7 @@
-// Pooled terrain with vertex pulling and triplanar materials (D10, D14, D19). Vertices arrive
-// packed (vx_core::mesh) and chunk local; the chunk table supplies the camera relative offset,
-// so no world position ever reaches this shader (D4). Units are metres.
+// Pooled terrain with vertex pulling and triplanar materials (D10, D14, D19) into the G-buffer
+// (D25). Vertices arrive packed (vx_core::mesh) and chunk local; the chunk table supplies the
+// camera relative offset, so no world position ever reaches this shader (D4). Units are metres.
+// Lighting happens in lighting.wgsl.
 //
 // The struct layouts match `FrameUniform`, `PackedVertex` and `ChunkEntry` in
 // `crates/vx_render/src/terrain.rs` (engineering rule 9) and are repeated in `terrain_cull.wgsl`.
@@ -117,8 +118,15 @@ fn triplanar(layer: u32, p: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>, blend: vec3
     return x * blend.x + y * blend.y + z * blend.z;
 }
 
+struct GBuffer {
+    // Linear albedo (the target stores sRGB), alpha 1 where terrain was drawn.
+    @location(0) albedo: vec4<f32>,
+    // Unit normal in body fixed axes, w reserved.
+    @location(1) normal: vec4<f32>,
+};
+
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOut) -> GBuffer {
     let n = normalize(in.normal);
     var blend = pow(abs(n), vec3<f32>(TRIPLANAR_SHARPNESS));
     blend = blend / (blend.x + blend.y + blend.z);
@@ -143,8 +151,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         albedo = triplanar(0u, p, dx, dy, blend);
     }
 
-    let sun = max(dot(n, frame.sun_dir.xyz), 0.0);
-    let sky = 0.5 + 0.5 * n.y;
-    let lit = albedo * (sun + frame.sun_dir.w * mix(0.35, 1.0, sky));
-    return vec4<f32>(lit, 1.0);
+    var out: GBuffer;
+    out.albedo = vec4<f32>(albedo, 1.0);
+    out.normal = vec4<f32>(n, 0.0);
+    return out;
 }

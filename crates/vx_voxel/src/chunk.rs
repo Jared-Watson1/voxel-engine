@@ -22,9 +22,12 @@ impl Material {
     pub const SOIL: Self = Self(2);
     pub const GRASS: Self = Self(3);
     pub const SAND: Self = Self(4);
+    /// Snow above the snow line (M2). Workstream B adds its texture layer and raises `COUNT`.
+    pub const SNOW: Self = Self(5);
     /// Largest id the vertex format carries.
     pub const MAX_ID: u8 = vx_core::mesh::MAX_MATERIAL_ID;
-    /// Number of material ids in use in M1, air included; texture arrays have this many layers.
+    /// Number of material ids with a texture layer, air included; texture arrays have this many
+    /// layers.
     pub const COUNT: usize = 5;
 
     pub fn name(self) -> &'static str {
@@ -34,6 +37,7 @@ impl Material {
             Self::SOIL => "soil",
             Self::GRASS => "grass",
             Self::SAND => "sand",
+            Self::SNOW => "snow",
             _ => "unknown",
         }
     }
@@ -97,7 +101,8 @@ impl Voxel {
 /// A dense `SAMPLES_PER_AXIS`^3 block of voxels for chunk `key`: the working form for
 /// generation, brushes and meshing. The resident form is [`crate::ChunkStore`].
 ///
-/// Sample spacing is `voxel_size_m` from the world config (D11), never a literal.
+/// Sample spacing is the level's voxel size, `voxel_size_m * 2^level` from the world config (D11,
+/// D20), never a literal.
 #[derive(Clone)]
 pub struct Chunk {
     key: ChunkKey,
@@ -106,11 +111,12 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub fn new(key: ChunkKey, voxel_size_m: f64) -> Self {
-        assert!(voxel_size_m > 0.0, "voxel size must be positive");
+    /// An all air chunk for `key`, whose sample spacing is `base_voxel_size_m * 2^key.level`.
+    pub fn new(key: ChunkKey, base_voxel_size_m: f64) -> Self {
+        assert!(base_voxel_size_m > 0.0, "voxel size must be positive");
         Self {
             key,
-            voxel_size_m,
+            voxel_size_m: key.voxel_size_m(base_voxel_size_m),
             voxels: vec![Voxel::AIR; SAMPLES_PER_AXIS.pow(3)].into_boxed_slice(),
         }
     }
@@ -129,6 +135,7 @@ impl Chunk {
         WorldPos::body_fixed(self.key.as_ivec3().as_dvec3() * extent)
     }
 
+    /// Sample spacing of this chunk's level in metres.
     pub fn voxel_size_m(&self) -> f64 {
         self.voxel_size_m
     }

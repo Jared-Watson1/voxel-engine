@@ -1,44 +1,146 @@
 use glam::{DVec3, IVec3};
 use vx_core::{CHUNK_SIZE, WorldConfig, WorldPos};
 
-/// Coordinate of a chunk in the chunk grid: the chunk covers world sample coordinates
-/// `32 * key` to `32 * key + 32` along each axis, and its stored block (D16) runs one sample further
-/// on each side.
+/// Coordinate of a chunk in the octree (D20): at level `level` the chunk covers world sample
+/// coordinates `32 * key` to `32 * key + 32` along each axis, in units of the level's voxel size
+/// (`voxel_size_m * 2^level`), and its stored block (D16) runs one sample further on each side.
+/// Level 0 is the finest. The derived order sorts by level, then x, y and z.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkKey {
+    pub level: u8,
     pub x: i32,
     pub y: i32,
     pub z: i32,
 }
 
+/// One of the six faces of a chunk. The discriminant is the bit index in a transition mask
+/// (`1 << face as u8`): the bit is set when the neighbour across the face is drawn one level finer
+/// (D22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Face {
+    LowX = 0,
+    HighX = 1,
+    LowY = 2,
+    HighY = 3,
+    LowZ = 4,
+    HighZ = 5,
+}
+
+impl Face {
+    pub const ALL: [Self; 6] = [
+        Self::LowX,
+        Self::HighX,
+        Self::LowY,
+        Self::HighY,
+        Self::LowZ,
+        Self::HighZ,
+    ];
+
+    /// 0 for x, 1 for y, 2 for z.
+    pub const fn axis(self) -> usize {
+        self as usize / 2
+    }
+
+    pub const fn is_high(self) -> bool {
+        self as usize % 2 == 1
+    }
+
+    pub const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
+    pub const fn opposite(self) -> Self {
+        Self::ALL[self as usize ^ 1]
+    }
+
+    /// Unit step across the face in chunk coordinates.
+    pub fn step(self) -> IVec3 {
+        let mut v = IVec3::ZERO;
+        v[self.axis()] = if self.is_high() { 1 } else { -1 };
+        v
+    }
+}
+
 impl ChunkKey {
+    /// A level 0 key.
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
-        Self { x, y, z }
+        Self { level: 0, x, y, z }
+    }
+
+    pub const fn at_level(level: u8, x: i32, y: i32, z: i32) -> Self {
+        Self { level, x, y, z }
     }
 
     pub const fn as_ivec3(self) -> IVec3 {
         IVec3::new(self.x, self.y, self.z)
     }
 
-    /// Position of local sample (0, 0, 0) in the body fixed frame.
-    pub fn origin(self, config: &WorldConfig) -> WorldPos {
-        let extent = config.chunk_extent_m();
-        WorldPos::body_fixed(DVec3::new(
-            f64::from(self.x) * extent,
-            f64::from(self.y) * extent,
-            f64::from(self.z) * extent,
-        ))
+    fn with_coords(self, c: IVec3) -> Self {
+        Self::at_level(self.level, c.x, c.y, c.z)
     }
 
-    /// The chunk whose cell region contains `position` (floor division by the chunk extent).
+    /// Sample spacing of this key's level in metres: `base_voxel_size_m * 2^level`, exact in f64.
+    pub fn voxel_size_m(self, base_voxel_size_m: f64) -> f64 {
+        base_voxel_size_m * f64::from(1u32 << self.level)
+    }
+
+    /// Edge length of this key's chunk in metres.
+    pub fn extent_m(self, base_voxel_size_m: f64) -> f64 {
+        CHUNK_SIZE as f64 * self.voxel_size_m(base_voxel_size_m)
+    }
+
+    /// Position of local sample (0, 0, 0) in the body fixed frame.
+    pub fn origin(self, config: &WorldConfig) -> WorldPos {
+        WorldPos::body_fixed(self.origin_m(config.voxel_size_m))
+    }
+
+    /// Position of local sample (0, 0, 0) in metres, from the integer sample index times the
+    /// level's voxel size (one rounding, as `Chunk::sample_position`).
+    pub fn origin_m(self, base_voxel_size_m: f64) -> DVec3 {
+        (self.as_ivec3() * CHUNK_SIZE as i32).as_dvec3() * self.voxel_size_m(base_voxel_size_m)
+    }
+
+    /// The cell region (apron excluded) as minimum and maximum corners in metres.
+    pub fn bounds_m(self, base_voxel_size_m: f64) -> (DVec3, DVec3) {
+        let min = self.origin_m(base_voxel_size_m);
+        (min, min + DVec3::splat(self.extent_m(base_voxel_size_m)))
+    }
+
+    /// The level 0 chunk whose cell region contains `position` (floor division by the extent).
     pub fn containing(position: WorldPos, config: &WorldConfig) -> Self {
-        let extent = config.chunk_extent_m();
+        Self::containing_at(position, 0, config)
+    }
+
+    /// The chunk of `level` whose cell region contains `position`.
+    pub fn containing_at(position: WorldPos, level: u8, config: &WorldConfig) -> Self {
+        let extent = Self::at_level(level, 0, 0, 0).extent_m(config.voxel_size_m);
         let f = |v: f64| (v / extent).floor() as i32;
-        Self::new(f(position.m.x), f(position.m.y), f(position.m.z))
+        Self::at_level(level, f(position.m.x), f(position.m.y), f(position.m.z))
     }
 
     pub fn offset(self, dx: i32, dy: i32, dz: i32) -> Self {
-        Self::new(self.x + dx, self.y + dy, self.z + dz)
+        Self::at_level(self.level, self.x + dx, self.y + dy, self.z + dz)
+    }
+
+    /// The same level neighbour across `face`.
+    pub fn neighbour(self, face: Face) -> Self {
+        self.with_coords(self.as_ivec3() + face.step())
+    }
+
+    /// The key one level coarser that contains this one.
+    pub fn parent(self) -> Self {
+        let c = self.as_ivec3().div_euclid(IVec3::splat(2));
+        Self::at_level(self.level + 1, c.x, c.y, c.z)
+    }
+
+    /// The eight keys one level finer, x fastest, then y, then z. `None` at level 0.
+    pub fn children(self) -> Option<[Self; 8]> {
+        let level = self.level.checked_sub(1)?;
+        let base = self.as_ivec3() * 2;
+        Some(std::array::from_fn(|i| {
+            let c = base + IVec3::new((i & 1) as i32, ((i >> 1) & 1) as i32, (i >> 2) as i32);
+            Self::at_level(level, c.x, c.y, c.z)
+        }))
     }
 
     /// Squared distance between two keys in chunks, for streaming priorities.
@@ -67,9 +169,15 @@ impl ChunkKey {
         Self::chunks_intersecting_samples(sample, sample)
     }
 
-    /// Every chunk whose stored block intersects the inclusive world sample box `min` to `max`.
-    /// A brush's dirty set is this box for its padded bounds.
+    /// Every level 0 chunk whose stored block intersects the inclusive world sample box `min` to
+    /// `max`. A brush's dirty set is this box for its padded bounds.
     pub fn chunks_intersecting_samples(min: IVec3, max: IVec3) -> Vec<Self> {
+        Self::chunks_intersecting_samples_at(0, min, max)
+    }
+
+    /// Every chunk of `level` whose stored block intersects the inclusive box `min` to `max` of
+    /// world sample coordinates in that level's units.
+    pub fn chunks_intersecting_samples_at(level: u8, min: IVec3, max: IVec3) -> Vec<Self> {
         debug_assert!(
             min.cmple(max).all(),
             "sample box min {min} exceeds max {max}"
@@ -82,7 +190,7 @@ impl ChunkKey {
         for z in z0..=z1 {
             for y in y0..=y1 {
                 for x in x0..=x1 {
-                    keys.push(Self::new(x, y, z));
+                    keys.push(Self::at_level(level, x, y, z));
                 }
             }
         }
@@ -175,6 +283,29 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), keys.len(), "no duplicate keys");
+    }
+
+    #[test]
+    fn levels_scale_the_extent_and_nest() {
+        let k = ChunkKey::at_level(3, -1, 2, 5);
+        assert_eq!(k.voxel_size_m(0.5), 4.0);
+        assert_eq!(k.extent_m(0.5), 128.0);
+        assert_eq!(k.origin_m(0.5), DVec3::new(-128.0, 256.0, 640.0));
+        let children = k.children().unwrap();
+        assert!(children.iter().all(|c| c.level == 2 && c.parent() == k));
+        assert_eq!(children[0], ChunkKey::at_level(2, -2, 4, 10));
+        assert_eq!(children[7], ChunkKey::at_level(2, -1, 5, 11));
+        assert_eq!(ChunkKey::new(0, 0, 0).children(), None);
+        let (min, max) = k.bounds_m(0.5);
+        let (cmin, _) = children[0].bounds_m(0.5);
+        let (_, cmax) = children[7].bounds_m(0.5);
+        assert_eq!((min, max), (cmin, cmax));
+        for face in Face::ALL {
+            assert_eq!(k.neighbour(face).neighbour(face.opposite()), k);
+            assert_eq!(face.opposite().opposite(), face);
+        }
+        let mask: u8 = Face::ALL.iter().map(|f| f.bit()).sum();
+        assert_eq!(mask, 0b11_1111);
     }
 
     #[test]

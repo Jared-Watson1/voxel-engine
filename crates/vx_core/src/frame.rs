@@ -1,14 +1,18 @@
 use glam::{DVec3, Vec3};
 
-/// Reference frame a position is expressed in (D4).
-///
-/// Only the body fixed frame exists in M0; the system and body centred inertial frames arrive
-/// with the universe crate in M6.
+/// Reference frame a position is expressed in (D4). Conversions between them are owned by
+/// `vx_universe` (D24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Frame {
-    /// Origin at the body centre, axes rotating with the body.
+    /// Origin at the body centre, axes rotating with the body: +Y is the north pole (the rotation
+    /// axis) and +X the prime meridian.
     #[default]
     BodyFixed,
+    /// Origin at the body centre, axes fixed to the system frame's axes.
+    BodyCentredInertial,
+    /// Origin at the star system's barycentre, inertial: +Y is the ecliptic north, the ecliptic is
+    /// the XZ plane and +X the reference direction.
+    System,
 }
 
 /// An f64 position in metres in an explicit frame.

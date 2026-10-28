@@ -1,0 +1,68 @@
+// Star system (D24) and the planet the voxel world belongs to (D11, D21, D25). Values here are the
+// design defaults; see SystemConfig in crates/vx_universe/src/system.rs and PlanetParams in
+// crates/vx_core/src/config.rs for each supported range. Missing fields take the design default.
+// Axes: the system frame has +Y at the ecliptic north and the ecliptic in the XZ plane; a body
+// fixed frame has +Y at the north pole and +X through the prime meridian.
+(
+    star: (
+        gm_m3_s2: 1.32712440018e20,
+        luminosity_w: 3.828e26,
+        radius_km: 696000.0,
+    ),
+    planet: (
+        params: (
+            radius_km: 10.0,
+            surface_gravity_m_s2: 9.81,
+            rotation_period_s: 3600.0,
+            axial_tilt_deg: 15.0,
+            terrain: (
+                base_height_m: 0.0,
+                amplitude_m: 150.0,
+                wavelength_m: 2500.0,
+                octaves: 7,
+                detail_amplitude_m: 3.0,
+                detail_wavelength_m: 40.0,
+                sand_below_m: -40.0,
+                grass_depth_m: 1.5,
+                soil_depth_m: 4.0,
+                rock_slope: 1.0,
+                snow_above_m: 120.0,
+            ),
+            atmosphere: (
+                height_fraction: 0.1,
+                rayleigh_optical_depth: (0.0464, 0.1085, 0.2648),
+                rayleigh_scale_height_fraction: 0.08,
+                mie_scattering_optical_depth: 0.0048,
+                mie_absorption_optical_depth: 0.00528,
+                mie_scale_height_fraction: 0.012,
+                mie_asymmetry: 0.8,
+                ozone_optical_depth: (0.00975, 0.0282, 0.00128),
+                ozone_centre_fraction: 0.25,
+                ozone_width_fraction: 0.3,
+                ground_albedo: (0.3, 0.3, 0.3),
+            ),
+        ),
+        orbit: (
+            semi_major_axis_km: 149597870.7,
+            eccentricity: 0.0167,
+            inclination_deg: 0.0,
+            longitude_of_ascending_node_deg: 0.0,
+            argument_of_periapsis_deg: 0.0,
+            mean_anomaly_at_epoch_deg: 0.0,
+        ),
+        prime_meridian_at_epoch_deg: 0.0,
+    ),
+    moon: Some((
+        radius_km: 3.0,
+        albedo: 0.12,
+        orbit: (
+            semi_major_axis_km: 200.0,
+            eccentricity: 0.01,
+            inclination_deg: 5.0,
+            longitude_of_ascending_node_deg: 0.0,
+            argument_of_periapsis_deg: 0.0,
+            mean_anomaly_at_epoch_deg: 0.0,
+        ),
+    )),
+    start_time_s: 0.0,
+)

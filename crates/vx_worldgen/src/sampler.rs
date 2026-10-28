@@ -774,8 +774,8 @@ mod tests {
             voxel_size_m: 0.25,
             ..WorldConfig::default()
         };
-        let a = TerrainSampler::new(coarse.seed, coarse.terrain);
-        let b = TerrainSampler::new(fine.seed, fine.terrain);
+        let a = TerrainSampler::new(coarse.seed, TerrainParams::default());
+        let b = TerrainSampler::new(fine.seed, TerrainParams::default());
         for (x, z) in [(0.0, 0.0), (123.5, -77.25), (-4096.0, 999.0)] {
             assert_eq!(a.height_m(x, z).to_bits(), b.height_m(x, z).to_bits());
         }

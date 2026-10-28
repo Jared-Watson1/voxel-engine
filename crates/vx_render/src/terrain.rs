@@ -1,7 +1,12 @@
-//! The terrain pass (D10, D14, D19): pooled vertex and index buffers with a range allocator each,
-//! a slot table of resident meshes, the per frame chunk table and uniform, and the render
-//! pipeline that pulls packed vertices from the pool through the compacted index buffer. Culling
-//! lives in [`crate::cull`], the material array in [`crate::materials`].
+//! The terrain pass (D10, D14, D19, D22, D23): pooled vertex and index buffers with a range
+//! allocator each, a slot table of resident meshes with their placements, the chunk table and
+//! uniform, and the render pipeline that pulls packed vertices from the pool through the
+//! compacted index buffer into the G-buffer. Culling lives in [`crate::cull`], the material array
+//! in [`crate::materials`].
+//!
+//! M2 interface commit: the chunk table is still the M1 layout rebuilt each frame from the stored
+//! placements (offset minus the camera offset), with one voxel size and regular ranges only.
+//! Workstream E replaces it with the persistent 64 byte table of D23 and the transition ranges.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -15,8 +20,9 @@ use crate::cull::{CullPass, FLAG_RESIDENT, MAX_SLOTS, frustum_planes};
 use crate::materials::MaterialArray;
 use crate::pool::{Range, RangeAllocator};
 use crate::{
-    CullStats, DEPTH_COMPARE, DEPTH_FORMAT, FrameInput, MATERIAL_TILE_M, MeshHandle, PoolError,
-    PoolStats, PreparedMaterialTextures, TerrainPoolConfig,
+    ChunkPlacement, CullStats, DEPTH_COMPARE, DEPTH_FORMAT, FrameInput, GBUFFER_ALBEDO_FORMAT,
+    GBUFFER_NORMAL_FORMAT, MATERIAL_TILE_M, MeshHandle, MeshUpload, PoolError, PoolStats,
+    PreparedMaterialTextures, TerrainPoolConfig,
 };
 
 /// Built in copy of `assets/shaders/terrain.wgsl`, so the first frame needs no file I/O. The file
@@ -102,6 +108,7 @@ struct ResidentMesh {
     vertex_base: u32,
     index_base: u32,
     index_count: u32,
+    placement: ChunkPlacement,
 }
 
 pub(crate) struct TerrainPass {
@@ -133,7 +140,6 @@ impl TerrainPass {
     pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        color_format: wgpu::TextureFormat,
         pools: TerrainPoolConfig,
     ) -> Self {
         let vertex_pool = device.create_buffer(&wgpu::BufferDescriptor {
@@ -179,7 +185,7 @@ impl TerrainPass {
             bind_group_layouts: &[Some(&frame_layout), Some(materials.layout())],
             immediate_size: 0,
         });
-        let pipeline = build_pipeline(device, &pipeline_layout, color_format, TERRAIN_WGSL)
+        let pipeline = build_pipeline(device, &pipeline_layout, TERRAIN_WGSL)
             .expect("the built in terrain shader must compile");
         let frame_bind_group =
             frame_bind_group(device, &frame_layout, &uniform, &vertex_pool, &table_buffer);
@@ -215,13 +221,8 @@ impl TerrainPass {
         }
     }
 
-    pub(crate) fn reload(
-        &mut self,
-        device: &wgpu::Device,
-        color_format: wgpu::TextureFormat,
-        source: &str,
-    ) -> Result<(), String> {
-        self.pipeline = build_pipeline(device, &self.pipeline_layout, color_format, source)?;
+    pub(crate) fn reload(&mut self, device: &wgpu::Device, source: &str) -> Result<(), String> {
+        self.pipeline = build_pipeline(device, &self.pipeline_layout, source)?;
         Ok(())
     }
 
@@ -236,10 +237,11 @@ impl TerrainPass {
     pub(crate) fn upload_mesh(
         &mut self,
         queue: &wgpu::Queue,
-        vertices: &[PackedVertex],
-        indices: &[u32],
+        mesh: &MeshUpload,
+        placement: ChunkPlacement,
     ) -> Result<MeshHandle, PoolError> {
         profiling::scope!("terrain upload");
+        let (vertices, indices) = (mesh.vertices, mesh.indices);
         if vertices.is_empty() || indices.is_empty() {
             return Err(PoolError::EmptyMesh);
         }
@@ -283,10 +285,18 @@ impl TerrainPass {
             index_range,
             vertex_base: (vertex_range.offset / VERTEX_BYTES) as u32,
             index_base: (index_range.offset / INDEX_BYTES) as u32,
-            index_count: indices.len() as u32,
+            index_count: mesh.regular_index_count.min(indices.len() as u32),
+            placement,
         });
         self.mesh_count += 1;
         Ok(MeshHandle(slot))
+    }
+
+    pub(crate) fn set_placement(&mut self, handle: MeshHandle, placement: ChunkPlacement) {
+        match self.slots.get_mut(usize::from(handle.0)) {
+            Some(Some(mesh)) => mesh.placement = placement,
+            _ => tracing::warn!("set_placement: slot {} holds no mesh", handle.0),
+        }
     }
 
     pub(crate) fn free_mesh(&mut self, handle: MeshHandle) {
@@ -357,16 +367,19 @@ impl TerrainPass {
         let slot_count = self.slots.len().max(1);
         self.table.clear();
         self.table.resize(slot_count, ChunkEntry::zeroed());
-        for draw in frame.chunks {
-            let slot = usize::from(draw.handle.0);
-            // A handle freed earlier this frame has no mesh and is skipped, never drawn.
-            let Some(Some(mesh)) = self.slots.get(slot) else {
+        let mut voxel_size_m = 1.0;
+        for (slot, mesh) in self.slots.iter().enumerate() {
+            let Some(mesh) = mesh else {
                 continue;
             };
+            if !mesh.placement.visible {
+                continue;
+            }
+            voxel_size_m = mesh.placement.voxel_size_m;
             self.table[slot] = ChunkEntry {
-                offset_m: draw.offset_m.to_array(),
+                offset_m: (mesh.placement.offset_m - frame.camera_offset_m).to_array(),
                 vertex_base: mesh.vertex_base,
-                texture_phase_m: draw.texture_phase_m.to_array(),
+                texture_phase_m: mesh.placement.texture_phase_m.to_array(),
                 index_base: mesh.index_base,
                 index_count: mesh.index_count,
                 flags: FLAG_RESIDENT,
@@ -395,9 +408,9 @@ impl TerrainPass {
 
         let uniform = FrameUniform::new(
             frame.view_proj,
-            frame.sun_dir,
-            frame.ambient,
-            frame.voxel_size_m,
+            frame.sun.direction,
+            0.0,
+            voxel_size_m,
             slot_count as u32,
         );
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -492,7 +505,6 @@ fn frame_bind_group(
 fn build_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
-    color_format: wgpu::TextureFormat,
     source: &str,
 ) -> Result<wgpu::RenderPipeline, String> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -527,11 +539,18 @@ fn build_pipeline(
             module: &module,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: color_format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: GBUFFER_ALBEDO_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: GBUFFER_NORMAL_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
         }),
         multiview_mask: None,
         cache: None,
@@ -546,8 +565,8 @@ fn build_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ChunkDraw;
     use crate::cull::Counters;
+    use crate::{PlanetView, SunLight};
     use vx_core::{Projection, VertexAttributes};
 
     /// A device without a surface, or `None` when the machine has no adapter (CI).
@@ -597,6 +616,43 @@ mod tests {
         bytes
     }
 
+    fn upload(
+        pass: &mut TerrainPass,
+        queue: &wgpu::Queue,
+        vertices: &[PackedVertex],
+        indices: &[u32],
+        offset_m: Vec3,
+    ) -> Result<MeshHandle, PoolError> {
+        pass.upload_mesh(
+            queue,
+            &MeshUpload {
+                vertices,
+                indices,
+                regular_index_count: indices.len() as u32,
+                transition_index_counts: [0; 6],
+            },
+            ChunkPlacement {
+                offset_m,
+                texture_phase_m: Vec3::ZERO,
+                voxel_size_m: 1.0,
+                transition_mask: 0,
+                visible: true,
+            },
+        )
+    }
+
+    fn frame_input(view_proj: Mat4) -> FrameInput<'static> {
+        FrameInput {
+            view_proj,
+            camera_offset_m: Vec3::ZERO,
+            planet: PlanetView::default(),
+            sun: SunLight::default(),
+            moon: None,
+            exposure_ev: 0.0,
+            egui: None,
+        }
+    }
+
     const TEST_POOLS: TerrainPoolConfig = TerrainPoolConfig {
         vertex_bytes: 1 << 16,
         index_bytes: 1 << 16,
@@ -608,42 +664,31 @@ mod tests {
             eprintln!("no GPU adapter available, skipping cull_and_compact_on_the_gpu");
             return;
         };
-        let mut pass = TerrainPass::new(
-            &device,
-            &queue,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            TEST_POOLS,
-        );
+        let mut pass = TerrainPass::new(&device, &queue, TEST_POOLS);
         let (vertices, indices) = quad();
         // Uploaded first so its vertex base is 0, which makes the rebase of the visible mesh
-        // observable (vertex base 4).
-        let hidden = pass.upload_mesh(&queue, &vertices, &indices).unwrap();
-        let seen = pass.upload_mesh(&queue, &vertices, &indices).unwrap();
+        // observable (vertex base 4). The seen chunk spans z from -40 to -8 in front of the
+        // camera; the hidden one spans z from 20 to 52 behind it.
+        let hidden = upload(
+            &mut pass,
+            &queue,
+            &vertices,
+            &indices,
+            Vec3::new(-16.0, -16.0, 20.0),
+        )
+        .unwrap();
+        let seen = upload(
+            &mut pass,
+            &queue,
+            &vertices,
+            &indices,
+            Vec3::new(-16.0, -16.0, -40.0),
+        )
+        .unwrap();
         assert_eq!((hidden, seen), (MeshHandle(0), MeshHandle(1)));
 
         let view_proj = Projection::reverse_z_infinite(std::f32::consts::FRAC_PI_3, 1.0, 0.05);
-        // The seen chunk spans z from -40 to -8 in front of the camera; the hidden one spans
-        // z from 20 to 52 behind it.
-        let chunks = [
-            ChunkDraw {
-                handle: seen,
-                offset_m: Vec3::new(-16.0, -16.0, -40.0),
-                texture_phase_m: Vec3::ZERO,
-            },
-            ChunkDraw {
-                handle: hidden,
-                offset_m: Vec3::new(-16.0, -16.0, 20.0),
-                texture_phase_m: Vec3::ZERO,
-            },
-        ];
-        let frame = FrameInput {
-            view_proj,
-            chunks: &chunks,
-            voxel_size_m: 1.0,
-            sun_dir: Vec3::Y,
-            ambient: 0.2,
-            egui: None,
-        };
+        let frame = frame_input(view_proj);
         pass.prepare_frame(&device, &queue, &frame);
         assert_eq!(pass.slot_count_this_frame, 2);
 
@@ -693,7 +738,7 @@ mod tests {
         assert_eq!(stats.triangles, 2);
         assert_eq!(stats.frames_old, 0);
 
-        // A handle freed before the frame is skipped even though it is still listed.
+        // A freed handle is never drawn.
         pass.free_mesh(seen);
         pass.prepare_frame(&device, &queue, &frame);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -722,7 +767,6 @@ mod tests {
         let mut pass = TerrainPass::new(
             &device,
             &queue,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
             TerrainPoolConfig {
                 vertex_bytes: 4 * VERTEX_BYTES * 4,
                 index_bytes: 8 * INDEX_BYTES,
@@ -730,12 +774,12 @@ mod tests {
         );
         let (vertices, indices) = quad();
         assert!(matches!(
-            pass.upload_mesh(&queue, &[], &indices),
+            upload(&mut pass, &queue, &[], &indices, Vec3::ZERO),
             Err(PoolError::EmptyMesh)
         ));
-        let first = pass.upload_mesh(&queue, &vertices, &indices).unwrap();
+        let first = upload(&mut pass, &queue, &vertices, &indices, Vec3::ZERO).unwrap();
         let before = pass.pool_stats();
-        let err = pass.upload_mesh(&queue, &vertices, &indices).unwrap_err();
+        let err = upload(&mut pass, &queue, &vertices, &indices, Vec3::ZERO).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -775,7 +819,7 @@ mod tests {
             0,
             "a double free is a warning, not a panic"
         );
-        let again = pass.upload_mesh(&queue, &vertices, &indices).unwrap();
+        let again = upload(&mut pass, &queue, &vertices, &indices, Vec3::ZERO).unwrap();
         assert_eq!(again, MeshHandle(0), "the lowest free slot is reused");
     }
 

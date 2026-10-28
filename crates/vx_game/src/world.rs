@@ -15,12 +15,15 @@ use std::time::Instant;
 
 use glam::{DVec3, IVec3, Vec3};
 use vx_core::{
-    Budgets, CHUNK_SIZE, CancelToken, JobSystem, Priority, Stage, StageStats, WorldConfig,
-    WorldPos, camera_relative,
+    Budgets, CHUNK_SIZE, CancelToken, JobSystem, Priority, Stage, StageStats, WorldConfig, WorldPos,
 };
-use vx_render::{ChunkDraw, MATERIAL_TILE_M, MeshHandle, Renderer};
+use vx_render::{ChunkPlacement, MATERIAL_TILE_M, MeshHandle, MeshUpload, Renderer};
 use vx_voxel::{Brush, Chunk, ChunkKey, ChunkStore, PackedMesh, Voxel, mesh_chunk};
 use vx_worldgen::TerrainSampler;
+
+/// The M1 flat world's streaming radius, kept until the planet world replaces this module.
+pub const VIEW_RADIUS_CHUNKS: u32 = 16;
+const EVICT_RADIUS_CHUNKS: u32 = 18;
 
 pub const STAGE_GENERATE: Stage = Stage(0);
 pub const STAGE_MESH: Stage = Stage(1);
@@ -169,9 +172,12 @@ pub struct World {
 
 impl World {
     pub fn new(config: WorldConfig, jobs: JobSystem) -> Self {
-        let sampler = Arc::new(TerrainSampler::new(config.seed, config.terrain));
-        let r = i32::try_from(config.view_radius_chunks).unwrap_or(i32::MAX);
-        let r_sq = u64::from(config.view_radius_chunks).pow(2);
+        let sampler = Arc::new(TerrainSampler::new(
+            config.seed,
+            vx_core::TerrainParams::default(),
+        ));
+        let r = VIEW_RADIUS_CHUNKS as i32;
+        let r_sq = u64::from(VIEW_RADIUS_CHUNKS).pow(2);
         let mut offsets = Vec::new();
         for z in -r..=r {
             for y in -r..=r {
@@ -275,7 +281,7 @@ impl World {
     /// Removes up to `CHECKS_PER_FRAME` chunks beyond the evict radius.
     fn evict(&mut self, renderer: &mut Renderer) {
         let Some(centre) = self.centre else { return };
-        let evict_sq = u64::from(self.config.evict_radius_chunks()).pow(2);
+        let evict_sq = u64::from(EVICT_RADIUS_CHUNKS).pow(2);
         let end = (self.evict_cursor + CHECKS_PER_FRAME).min(self.evict_queue.len());
         for i in self.evict_cursor..end {
             let key = self.evict_queue[i];
@@ -469,7 +475,22 @@ impl World {
                 }
                 continue;
             }
-            match renderer.upload_mesh(&upload.mesh.vertices, &upload.mesh.indices) {
+            let origin = upload.key.origin(&self.config).m;
+            let phase = origin.map(|v| v.rem_euclid(MATERIAL_TILE_M));
+            let placement = ChunkPlacement {
+                offset_m: origin.as_vec3(),
+                texture_phase_m: Vec3::new(phase.x as f32, phase.y as f32, phase.z as f32),
+                voxel_size_m: self.config.voxel_size_m as f32,
+                transition_mask: 0,
+                visible: true,
+            };
+            let mesh = MeshUpload {
+                vertices: &upload.mesh.vertices,
+                indices: &upload.mesh.indices,
+                regular_index_count: upload.mesh.regular_index_count,
+                transition_index_counts: upload.mesh.transition_index_counts,
+            };
+            match renderer.upload_mesh(&mesh, placement) {
                 Ok(handle) => {
                     if let Some(old) = slot.mesh.replace(handle) {
                         renderer.free_mesh(old);
@@ -530,23 +551,6 @@ impl World {
             }
             self.stats.voxel_bytes -= slot.bytes;
         }
-    }
-
-    /// Every resident mesh with its camera relative offset, computed in f64 (D4).
-    pub fn fill_draw_list(&mut self, camera: WorldPos, out: &mut Vec<ChunkDraw>) {
-        profiling::scope!("World::fill_draw_list");
-        let start = Instant::now();
-        out.clear();
-        for (key, &handle) in &self.meshed {
-            let origin = key.origin(&self.config);
-            let phase = origin.m.map(|v| v.rem_euclid(MATERIAL_TILE_M));
-            out.push(ChunkDraw {
-                handle,
-                offset_m: camera_relative(origin, camera),
-                texture_phase_m: Vec3::new(phase.x as f32, phase.y as f32, phase.z as f32),
-            });
-        }
-        self.stats.draw_list_ms = start.elapsed().as_secs_f64() * 1.0e3;
     }
 
     /// The stored sample at a world sample index, or `None` where no generated chunk holds it.

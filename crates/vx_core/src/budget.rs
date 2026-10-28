@@ -15,6 +15,9 @@ impl Budgets {
     pub const MAIN_THREAD_MS: f64 = 3.0;
     /// GPU time for the terrain pass.
     pub const TERRAIN_DRAW_MS: f64 = 6.0;
+    /// GPU time for the atmosphere LUTs, the lighting pass and the sky (design document: atmosphere
+    /// and sky under 1.5 ms).
+    pub const SKY_AND_LIGHTING_MS: f64 = 1.5;
     /// Generate plus mesh of one 32^3 chunk on one worker.
     pub const CHUNK_GENERATE_MESH_MS: f64 = 4.0;
     /// Compressed voxel data resident in RAM, apron included: 1.5 GB (decimal, as in the design

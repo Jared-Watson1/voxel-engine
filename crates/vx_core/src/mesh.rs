@@ -11,10 +11,15 @@
 //!   weight in bits `16 + 4i` to `16 + 4i + 3`. Ids are 0 to 15, weights 0 to 15; the shader
 //!   normalises the weights. Slot 0 is the dominant material.
 //! - word 3: chunk slot (index into the GPU chunk table, patched by the renderer at upload) in bits
-//!   0 to 15; bits 16 to 31 are reserved (M2 uses them for the transition side mask) and zero.
+//!   0 to 15; flags in bits 16 to 31 ([`FLAG_TRANSITION_FULL_RES`] in bit 16, the rest zero).
 //!
-//! Positions are quantised in voxel units so the layout is independent of `voxel_size_m`; the
-//! vertex shader multiplies by the voxel size from a uniform.
+//! Positions are quantised in voxel units so the layout is independent of the voxel size; the
+//! vertex shader multiplies by the chunk's own voxel size from the chunk table (D23).
+//!
+//! Transition faces (D22): a chunk's regular cells are meshed unshrunk, and the transition cells
+//! of each face are separate index ranges. The vertex shader moves vertices to Lengyel's
+//! secondary position for the faces in the chunk's transition mask; [`secondary_position_voxels`]
+//! is the reference the WGSL mirrors operation for operation.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
@@ -28,6 +33,12 @@ pub const MAX_MATERIAL_ID: u8 = 15;
 pub const MAX_MATERIAL_WEIGHT: u8 = 15;
 /// Material slots per vertex.
 pub const MATERIAL_SLOTS: usize = 4;
+/// Word 3 flag: a transition cell vertex on the full resolution face, which never moves (D22).
+pub const FLAG_TRANSITION_FULL_RES: u16 = 1;
+/// Width of a transition cell as a fraction of the coarse cell (Lengyel's `w`, D22).
+pub const TRANSITION_WIDTH_CELLS: f32 = 0.5;
+/// Chunk extent in voxels as the float the displacement compares against.
+const CHUNK_VOXELS: f32 = crate::config::CHUNK_SIZE as f32;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Pod, Zeroable)]
@@ -96,11 +107,65 @@ impl PackedVertex {
         (self.words[3] & 0xFFFF) as u16
     }
 
-    /// Returns the vertex with its chunk slot set and the reserved bits untouched.
+    /// Returns the vertex with its chunk slot set and the flags untouched.
     pub fn with_chunk_slot(mut self, slot: u16) -> Self {
         self.words[3] = (self.words[3] & 0xFFFF_0000) | u32::from(slot);
         self
     }
+
+    pub fn flags(self) -> u16 {
+        (self.words[3] >> 16) as u16
+    }
+
+    /// Returns the vertex with its flags set and the chunk slot untouched.
+    pub fn with_flags(mut self, flags: u16) -> Self {
+        self.words[3] = (self.words[3] & 0xFFFF) | (u32::from(flags) << 16);
+        self
+    }
+}
+
+/// Lengyel's secondary vertex position (dissertation section 4.3) for a chunk whose transition
+/// `mask` has bit `2 * axis` set when the neighbour across the low face of `axis` is drawn one level
+/// finer and bit `2 * axis + 1` for the high face (D22). `position_voxels` is chunk local (0 to 32)
+/// and `normal` the unit vertex normal.
+///
+/// Within one cell of a masked face the vertex moves inward by `(1 - d) * w` cells, `d` its
+/// distance from that face in cells, and the move is projected onto the tangent plane of the
+/// normal. A vertex lying exactly on a face whose bit is clear stays put (godot_voxel's rule, so a
+/// same level neighbour keeps a bit identical shared face), and so does a vertex flagged
+/// [`FLAG_TRANSITION_FULL_RES`]. Positions compare exactly against 0 and 32, which the packed
+/// format represents exactly.
+///
+/// The WGSL in `assets/shaders/terrain.wgsl` must perform the same operations in the same order
+/// so the coarse chunk's half resolution face and its transition cells coincide bit for bit.
+pub fn secondary_position_voxels(
+    position_voxels: Vec3,
+    normal: Vec3,
+    flags: u16,
+    mask: u8,
+) -> Vec3 {
+    if mask == 0 || flags & FLAG_TRANSITION_FULL_RES != 0 {
+        return position_voxels;
+    }
+    let p = position_voxels.to_array();
+    let mut delta = [0.0f32; 3];
+    for axis in 0..3 {
+        let low = mask & (1 << (2 * axis)) != 0;
+        let high = mask & (1 << (2 * axis + 1)) != 0;
+        if (p[axis] == 0.0 && !low) || (p[axis] == CHUNK_VOXELS && !high) {
+            return position_voxels;
+        }
+        if low && p[axis] < 1.0 {
+            delta[axis] = (1.0 - p[axis]) * TRANSITION_WIDTH_CELLS;
+        } else if high && p[axis] > CHUNK_VOXELS - 1.0 {
+            delta[axis] = (CHUNK_VOXELS - 1.0 - p[axis]) * TRANSITION_WIDTH_CELLS;
+        }
+    }
+    let delta = Vec3::from_array(delta);
+    if delta == Vec3::ZERO {
+        return position_voxels;
+    }
+    position_voxels + (delta - normal * normal.dot(delta))
 }
 
 /// Octahedral normal encoding (Cigolle et al. 2014, "A Survey of Efficient Representations for
@@ -182,13 +247,54 @@ mod tests {
         let v = PackedVertex::pack(&attributes).with_chunk_slot(0xBEEF);
         assert_eq!(v.unpack().materials, attributes.materials);
         assert_eq!(v.chunk_slot(), 0xBEEF);
-        assert_eq!(v.words[3] >> 16, 0, "reserved bits stay zero");
+        assert_eq!(v.flags(), 0, "flags start zero");
         assert_eq!(v.with_chunk_slot(7).chunk_slot(), 7);
+        let flagged = v.with_flags(FLAG_TRANSITION_FULL_RES);
+        assert_eq!(flagged.flags(), FLAG_TRANSITION_FULL_RES);
+        assert_eq!(flagged.chunk_slot(), 0xBEEF);
+        assert_eq!(flagged.with_chunk_slot(3).flags(), FLAG_TRANSITION_FULL_RES);
         let saturated = PackedVertex::pack(&VertexAttributes {
             materials: [(200, 200); 4],
             ..attributes
         });
         assert_eq!(saturated.unpack().materials, [(15, 15); 4]);
+    }
+
+    #[test]
+    fn secondary_position_moves_only_near_masked_faces() {
+        let up = Vec3::Y;
+        let low_x = 1u8;
+        // Not near any masked face, or no mask: unchanged.
+        let p = Vec3::new(5.0, 7.0, 9.0);
+        assert_eq!(secondary_position_voxels(p, up, 0, low_x), p);
+        assert_eq!(
+            secondary_position_voxels(Vec3::new(0.25, 7.0, 9.0), up, 0, 0),
+            Vec3::new(0.25, 7.0, 9.0)
+        );
+        // On the masked face with a normal in the tangent plane: moves the full width inward.
+        let moved = secondary_position_voxels(Vec3::new(0.0, 7.0, 9.0), up, 0, low_x);
+        assert_eq!(moved, Vec3::new(TRANSITION_WIDTH_CELLS, 7.0, 9.0));
+        // Half a cell in: half the width.
+        let moved = secondary_position_voxels(Vec3::new(0.5, 7.0, 9.0), up, 0, low_x);
+        assert_eq!(moved.x, 0.5 + 0.5 * TRANSITION_WIDTH_CELLS);
+        // A normal along the axis projects the move away entirely.
+        let moved = secondary_position_voxels(Vec3::new(0.0, 7.0, 9.0), Vec3::X, 0, low_x);
+        assert_eq!(moved, Vec3::new(0.0, 7.0, 9.0));
+        // The full resolution flag pins the vertex.
+        let pinned = secondary_position_voxels(
+            Vec3::new(0.0, 7.0, 9.0),
+            up,
+            FLAG_TRANSITION_FULL_RES,
+            low_x,
+        );
+        assert_eq!(pinned, Vec3::new(0.0, 7.0, 9.0));
+        // A vertex on a face without a transition stays put even near a masked face.
+        let corner = Vec3::new(0.25, 0.0, 9.0);
+        assert_eq!(secondary_position_voxels(corner, Vec3::Z, 0, low_x), corner);
+        // High face moves inward (negative).
+        let high_x = 2u8;
+        let moved = secondary_position_voxels(Vec3::new(32.0, 7.0, 9.0), up, 0, high_x);
+        assert_eq!(moved.x, 32.0 - TRANSITION_WIDTH_CELLS);
     }
 
     #[test]

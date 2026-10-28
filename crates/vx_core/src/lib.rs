@@ -13,7 +13,9 @@ pub mod time;
 pub mod watch;
 
 pub use budget::{BudgetMonitor, BudgetUse, Budgets};
-pub use config::{CHUNK_SIZE, ConfigError, TerrainParams, WorldConfig};
+pub use config::{
+    AtmosphereParams, CHUNK_SIZE, ConfigError, PlanetParams, TerrainParams, WorldConfig,
+};
 pub use frame::{Frame, WorldPos, camera_relative};
 pub use job::{CancelToken, JobSystem, Priority, Stage, StageStats};
 pub use mesh::{PackedVertex, VertexAttributes};

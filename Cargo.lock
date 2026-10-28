@@ -3126,6 +3126,13 @@ dependencies = [
 [[package]]
 name = "vx_universe"
 version = "0.1.0"
+dependencies = [
+ "glam",
+ "ron",
+ "serde",
+ "thiserror 2.0.21",
+ "vx_core",
+]
 
 [[package]]
 name = "vx_voxel"

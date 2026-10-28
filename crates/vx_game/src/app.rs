@@ -8,8 +8,8 @@ use vx_core::{
     BudgetMonitor, BudgetUse, Budgets, FileWatcher, JobSystem, Projection, WorldConfig, WorldPos,
 };
 use vx_render::{
-    ChunkDraw, EguiFrame, FrameInput, FrameStatus, MaterialTextures, PreparedMaterialTextures,
-    RenderSettings, Renderer,
+    EguiFrame, FrameInput, FrameStatus, MaterialTextures, PreparedMaterialTextures, RenderSettings,
+    Renderer,
 };
 use vx_voxel::{Brush, BrushOp, BrushShape, Material};
 use vx_worldgen::material_textures;
@@ -33,7 +33,6 @@ use crate::world::{STAGE_GENERATE, STAGE_MESH, STAGE_NAMES, World};
 const FOV_Y_RAD: f32 = std::f32::consts::FRAC_PI_3;
 const NEAR_PLANE_M: f32 = 0.05;
 const SUN_DIR: Vec3 = Vec3::new(-0.6, 0.7, 0.4);
-const AMBIENT: f32 = 0.18;
 /// Seconds of rendering after the world settles before measurements or captures start.
 const WARMUP_S: f64 = 2.0;
 /// Longest wait for the initial streaming to settle before an automated run proceeds anyway.
@@ -134,7 +133,6 @@ struct Running {
     world: Option<World>,
     world_error: Option<String>,
     shader_error: Option<String>,
-    draws: Vec<ChunkDraw>,
     brush: BrushSettings,
     flight: Option<Flight>,
     budget_monitor: BudgetMonitor,
@@ -341,7 +339,6 @@ impl Running {
             world: None,
             world_error: None,
             shader_error: None,
-            draws: Vec::new(),
             brush: BrushSettings {
                 op: BrushOp::Dig,
                 radius_voxels: args
@@ -399,7 +396,7 @@ impl Running {
         let direction = self.camera.orientation() * DVec3::NEG_Z;
         let right = self.camera.orientation() * DVec3::X;
         // Never pick beyond the streamed sphere, so a brush always lands on generated chunks.
-        let reach = BRUSH_REACH_CHUNKS.min(f64::from(config.view_radius_chunks) - 1.0)
+        let reach = BRUSH_REACH_CHUNKS.min(f64::from(crate::world::VIEW_RADIUS_CHUNKS) - 1.0)
             * config.chunk_extent_m();
         let Some(hit) = world.raycast(self.camera.position, direction, reach) else {
             return 0;
@@ -469,25 +466,28 @@ impl Running {
         sections.egui_ms = ms_since(egui_start);
 
         let draw_list_start = Instant::now();
-        let voxel_size_m = self
-            .world
-            .as_ref()
-            .map_or(1.0, |w| w.config().voxel_size_m as f32);
-        if let Some(world) = &mut self.world {
-            world.fill_draw_list(self.camera.position, &mut self.draws);
-        } else {
-            self.draws.clear();
-        }
+        // M1 bridge until the planet world: the render origin is the frame origin and the
+        // planet centre is far below, so up is +Y.
+        let camera_offset_m = self.camera.position.m.as_vec3();
+        let planet = vx_render::PlanetView {
+            centre_m: Vec3::new(0.0, -1.0e6 - camera_offset_m.y, 0.0),
+            radius_m: 1.0e6,
+            occluder_radius_m: 0.0,
+        };
         sections.draw_list_ms = ms_since(draw_list_start);
         let render_start = Instant::now();
         let rendered = {
             profiling::scope!("render");
             self.renderer.render(FrameInput {
                 view_proj: self.camera.view_proj(),
-                chunks: &self.draws,
-                voxel_size_m,
-                sun_dir: SUN_DIR.normalize(),
-                ambient: AMBIENT,
+                camera_offset_m,
+                planet,
+                sun: vx_render::SunLight {
+                    direction: SUN_DIR.normalize(),
+                    ..Default::default()
+                },
+                moon: None,
+                exposure_ev: 0.0,
                 egui: Some(EguiFrame {
                     primitives: &primitives,
                     textures_delta: full_output.textures_delta,
@@ -620,10 +620,10 @@ impl Running {
                 }
             };
             if event.path == self.terrain_shader_path {
-                let result = self.renderer.reload_terrain_shader(&contents);
+                let result = self.renderer.reload_shader("terrain.wgsl", &contents);
                 self.reload_shader("terrain", result);
             } else if event.path == self.cull_shader_path {
-                let result = self.renderer.reload_cull_shader(&contents);
+                let result = self.renderer.reload_shader("terrain_cull.wgsl", &contents);
                 self.reload_shader("cull", result);
             } else if event.path == self.world_path {
                 match parse_config(&contents, args) {
@@ -734,7 +734,7 @@ impl Running {
             camera_m: self.camera.position.m,
             speed_m_s: self.camera.speed_m_s,
             voxel_size_m: config.map(|c| c.voxel_size_m),
-            view_radius_chunks: config.map(|c| c.view_radius_chunks),
+            view_radius_chunks: config.map(|_| crate::world::VIEW_RADIUS_CHUNKS),
             seed: config.map(|c| c.seed),
             workers: self.jobs.worker_count(),
             world: self.world.as_ref().map(|w| w.stats().clone()),
@@ -858,7 +858,7 @@ impl Running {
              mesh_ms_max={:.3} generated={} meshed={} uploaded={} upload_failures={} \
              recentre_ms_max={:.3} world_update_ms_max={:.3}",
             config.map_or(f64::NAN, |c| c.voxel_size_m),
-            config.map_or(0, |c| c.view_radius_chunks),
+            config.map_or(0, |_| crate::world::VIEW_RADIUS_CHUNKS),
             config.map_or(0, |c| c.seed),
             w,
             h,
@@ -949,9 +949,6 @@ fn parse_config(text: &str, args: &Args) -> Result<WorldConfig, String> {
     let mut config = WorldConfig::from_ron_str(text).map_err(|e| e.to_string())?;
     if let Some(v) = args.voxel_size_m {
         config.voxel_size_m = v;
-    }
-    if let Some(r) = args.view_radius_chunks {
-        config.view_radius_chunks = r;
     }
     if let Some(s) = args.seed {
         config.seed = s;

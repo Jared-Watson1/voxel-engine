@@ -1,6 +1,7 @@
 use glam::{DVec3, IVec3};
 use vx_core::{CHUNK_SIZE, WorldConfig, WorldPos};
 
+use crate::block::SampleBlock;
 use crate::chunk::{Chunk, DISTANCE_UNITS_PER_VOXEL, Material, Voxel};
 use crate::key::ChunkKey;
 
@@ -58,11 +59,50 @@ impl Brush {
         self.sample_bounds_at(config.voxel_size_m)
     }
 
-    /// Every chunk whose stored block intersects [`Brush::sample_bounds`]: the set that must be
-    /// edited and remeshed.
+    /// Every level 0 chunk whose stored block intersects [`Brush::sample_bounds`]: the set that
+    /// must be edited and remeshed.
     pub fn affected_chunks(&self, config: &WorldConfig) -> Vec<ChunkKey> {
-        let (min, max) = self.sample_bounds(config);
-        ChunkKey::chunks_intersecting_samples(min, max)
+        self.affected_chunks_at(config, 0)
+    }
+
+    /// Every chunk of `level` whose stored block the brush can change, from the bounds at that
+    /// level's sample spacing (D20: the edit log replays at every level).
+    pub fn affected_chunks_at(&self, config: &WorldConfig, level: u8) -> Vec<ChunkKey> {
+        let (min, max) = self.sample_bounds_at(config.level_voxel_size_m(level));
+        ChunkKey::chunks_intersecting_samples_at(level, min, max)
+    }
+
+    /// Applies the brush to every sample of `block` inside the bounds, with the same arithmetic as
+    /// [`Brush::apply`], so a transition slab and the fine chunk it mirrors see the same edits.
+    /// Returns true if any sample changed.
+    pub fn apply_block(&self, block: &mut SampleBlock) -> bool {
+        let voxel_size_m = block.voxel_size_m();
+        let (min, max) = self.sample_bounds_at(voxel_size_m);
+        let min = min.max(block.min());
+        let max = max.min(block.max());
+        if min.cmpgt(max).any() {
+            return false;
+        }
+        let mut changed = false;
+        for z in min.z..=max.z {
+            for y in min.y..=max.y {
+                for x in min.x..=max.x {
+                    let world = IVec3::new(x, y, z);
+                    let p = world.as_dvec3() * voxel_size_m;
+                    let brush_voxels = self.signed_distance_m(p) / voxel_size_m;
+                    let Some(i) = block.index(world) else {
+                        continue;
+                    };
+                    let old = block.voxels()[i];
+                    let new = self.op.combine(old, brush_voxels);
+                    if new != old {
+                        block.voxels_mut()[i] = new;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// Applies the brush to every sample of `chunk` inside the bounds, apron included. Returns

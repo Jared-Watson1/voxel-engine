@@ -84,7 +84,7 @@ fn bench_chunk(options: &Options) -> Result<(), String> {
         config.seed = s;
     }
     config.validate().map_err(|e| e.to_string())?;
-    let sampler = TerrainSampler::new(config.seed, config.terrain);
+    let sampler = TerrainSampler::new(config.seed, vx_core::TerrainParams::default());
     let extent = config.chunk_extent_m();
 
     // Surface chunks: the chunk containing the terrain surface above a spread of columns.
