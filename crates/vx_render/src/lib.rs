@@ -11,7 +11,8 @@
 //! G-buffer. Lighting and the sky (D25): the atmosphere LUTs, one fullscreen lighting pass into an
 //! HDR target and a tonemap pass into the swapchain, with egui on top.
 //!
-//! Frame order: cull, terrain G-buffer, atmosphere LUTs, lighting, tonemap, egui.
+//! Frame order: cull, terrain G-buffer, atmosphere LUTs, lighting, tonemap, egui. Each pass is
+//! timed with timestamp queries at its boundaries when the adapter has them ([`GpuTimings`]).
 
 mod atmosphere;
 mod capture;
@@ -20,6 +21,7 @@ mod materials;
 mod pool;
 mod post;
 mod terrain;
+mod timing;
 
 use std::sync::Arc;
 
@@ -212,8 +214,35 @@ pub struct GpuTimings {
 }
 
 impl GpuTimings {
+    /// Names of the passes that count against [`Budgets::SKY_AND_LIGHTING_MS`]: the four LUT
+    /// passes (the static two only on frames after a parameter change) and the lighting pass.
+    pub const SKY_AND_LIGHTING_PASSES: [&'static str; 5] = [
+        "transmittance lut",
+        "multiple scattering lut",
+        "sky view lut",
+        "aerial perspective lut",
+        "lighting",
+    ];
+
     pub fn total_ms(&self) -> f64 {
         self.passes.iter().map(|(_, ms)| ms).sum()
+    }
+
+    /// Milliseconds of the named pass, `None` when it was not timed in this frame.
+    pub fn pass_ms(&self, name: &str) -> Option<f64> {
+        self.passes
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ms)| *ms)
+    }
+
+    /// GPU time of the atmosphere LUTs and the lighting pass, the sky and lighting budget.
+    pub fn sky_and_lighting_ms(&self) -> f64 {
+        self.passes
+            .iter()
+            .filter(|(n, _)| Self::SKY_AND_LIGHTING_PASSES.contains(n))
+            .map(|(_, ms)| ms)
+            .sum()
     }
 }
 
@@ -346,10 +375,7 @@ pub struct Renderer {
     /// Set when the last image was suboptimal; the surface cannot be reconfigured while an image
     /// is held, so it happens before the next acquire.
     reconfigure: bool,
-    targets: FrameTargets,
-    terrain: terrain::TerrainPass,
-    atmosphere: atmosphere::AtmospherePass,
-    post: post::PostPass,
+    passes: FramePasses,
     egui: egui_wgpu::Renderer,
     capture: capture::Capture,
     info: GpuInfo,
@@ -393,10 +419,13 @@ impl Renderer {
                     .min(adapter_limits.max_buffer_size),
             });
         }
+        // Timestamps at pass boundaries are all Apple GPUs offer; requested when present so the
+        // overlay can show GPU time per pass (engineering rule 4).
+        let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("vx device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits,
                 ..Default::default()
             }))?;
@@ -462,12 +491,18 @@ impl Renderer {
             info.present_mode
         );
 
-        let targets = FrameTargets::new(&device, config.width, config.height);
-        let terrain = terrain::TerrainPass::new(&device, &queue, settings.pools);
-        let atmosphere = atmosphere::AtmospherePass::new(&device, &queue);
-        let post = post::PostPass::new(&device, scene_format);
+        let passes = FramePasses::new(
+            &device,
+            &queue,
+            (config.width, config.height),
+            settings.pools,
+            scene_format,
+        );
         let egui = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let capture = capture::Capture::new(usage.contains(wgpu::TextureUsages::COPY_SRC));
+        if !passes.timer.supported() {
+            tracing::info!("no timestamp queries on this adapter; GPU pass timings disabled");
+        }
 
         Ok(Self {
             surface,
@@ -476,10 +511,7 @@ impl Renderer {
             config,
             scene_format,
             reconfigure: false,
-            targets,
-            terrain,
-            atmosphere,
-            post,
+            passes,
             egui,
             capture,
             info,
@@ -501,7 +533,7 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.targets = FrameTargets::new(&self.device, width, height);
+        self.passes.targets = FrameTargets::new(&self.device, width, height);
     }
 
     /// Copies a packed mesh into the pools, writes its chunk table entry and returns its chunk
@@ -512,29 +544,35 @@ impl Renderer {
         mesh: &MeshUpload,
         placement: ChunkPlacement,
     ) -> Result<MeshHandle, PoolError> {
-        self.terrain.upload_mesh(&self.queue, mesh, placement)
+        self.passes
+            .terrain
+            .upload_mesh(&self.queue, mesh, placement)
     }
 
     /// Replaces a resident chunk's placement; the table entry is rewritten before the next frame.
     pub fn set_placement(&mut self, handle: MeshHandle, placement: ChunkPlacement) {
-        self.terrain.set_placement(handle, placement);
+        self.passes.terrain.set_placement(handle, placement);
     }
 
     /// Releases the mesh's pool ranges and slot; it is not drawn from the next frame on. The slot
     /// may be handed to the next upload.
     pub fn free_mesh(&mut self, handle: MeshHandle) {
-        self.terrain.free_mesh(handle);
+        self.passes.terrain.free_mesh(handle);
     }
 
-    /// Sets the planet's atmosphere (D25); the static LUTs are recomputed before the next frame.
+    /// Sets the planet's atmosphere (D25); the static LUTs are recomputed over the next two
+    /// frames. The atmosphere's ground is [`PlanetView::radius_m`] of each frame; a different
+    /// `planet_radius_m` here is logged once and the frame's radius wins.
     pub fn set_atmosphere(&mut self, atmosphere: &AtmosphereParams, planet_radius_m: f64) {
-        self.atmosphere.set_params(atmosphere, planet_radius_m);
+        self.passes
+            .atmosphere
+            .set_params(atmosphere, planet_radius_m);
     }
 
     /// GPU time per pass, or `None` when the adapter has no timestamp queries or no readback has
     /// completed yet.
     pub fn gpu_timings(&self) -> Option<GpuTimings> {
-        None
+        self.passes.timer.timings()
     }
 
     /// Uploads a prepared material texture array (mip chains built by
@@ -542,9 +580,10 @@ impl Renderer {
     /// is used (magenta for layer 0, then grey, brown, green, yellow). A set the device cannot
     /// hold is logged and the previous array stays bound.
     pub fn set_material_textures(&mut self, textures: &PreparedMaterialTextures) {
-        self.terrain
+        self.passes
+            .terrain
             .set_material_textures(&self.device, &self.queue, textures);
-        let stats = self.terrain.pool_stats();
+        let stats = self.passes.terrain.pool_stats();
         if stats.gpu_bytes() > Budgets::GPU_TERRAIN_BYTES {
             tracing::warn!(
                 "GPU terrain memory {} bytes exceeds the {} byte budget after the material upload",
@@ -555,14 +594,14 @@ impl Renderer {
     }
 
     pub fn pool_stats(&self) -> PoolStats {
-        self.terrain.pool_stats()
+        self.passes.terrain.pool_stats()
     }
 
     /// Latest culling results, read back without blocking; `None` until the first readback.
     /// Readbacks are polled at the start of [`Renderer::render`], so the values describe a frame
     /// one or two renders ago (`frames_old`).
     pub fn cull_stats(&self) -> Option<CullStats> {
-        self.terrain.cull_stats()
+        self.passes.terrain.cull_stats()
     }
 
     /// Compiles new source for one of [`SHADER_FILES`] (a file name under `assets/shaders/`). On
@@ -570,11 +609,11 @@ impl Renderer {
     /// returned for logging (engineering rule 9).
     pub fn reload_shader(&mut self, file: &str, source: &str) -> Result<(), String> {
         match file {
-            "terrain.wgsl" => self.terrain.reload(&self.device, source),
-            "terrain_cull.wgsl" => self.terrain.reload_cull(&self.device, source),
-            "atmosphere.wgsl" => self.atmosphere.reload_luts(&self.device, source),
-            "lighting.wgsl" => self.atmosphere.reload_lighting(&self.device, source),
-            "tonemap.wgsl" => self.post.reload(&self.device, source),
+            "terrain.wgsl" => self.passes.terrain.reload(&self.device, source),
+            "terrain_cull.wgsl" => self.passes.terrain.reload_cull(&self.device, source),
+            "atmosphere.wgsl" => self.passes.atmosphere.reload_luts(&self.device, source),
+            "lighting.wgsl" => self.passes.atmosphere.reload_lighting(&self.device, source),
+            "tonemap.wgsl" => self.passes.post.reload(&self.device, source),
             other => Err(format!("{other} is not a renderer shader")),
         }
     }
@@ -657,16 +696,117 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        self.terrain.prepare_frame(&self.device, &self.queue, frame);
-        self.atmosphere.prepare_frame(&self.queue, frame);
-        self.post.prepare_frame(&self.queue, frame);
-
+        self.passes.timer.begin_frame(&self.device);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        self.terrain.encode_cull(&mut encoder);
+        self.passes
+            .encode(&self.device, &self.queue, &mut encoder, frame, &scene_view);
+
+        let mut extra_buffers = Vec::new();
+        if let Some(ui) = &frame.egui {
+            profiling::scope!("egui pass");
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point: ui.pixels_per_point,
+            };
+            extra_buffers = self.egui.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                ui.primitives,
+                &screen,
+            );
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &ui_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: self.passes.timer.render_writes("egui"),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.egui.render(&mut pass, ui.primitives, &screen);
+        }
+
+        self.capture
+            .encode_copy(&self.device, &mut encoder, &surface_texture.texture);
+        self.passes.timer.end_frame(&mut encoder);
+
+        {
+            profiling::scope!("submit and present");
+            self.queue
+                .submit(extra_buffers.into_iter().chain([encoder.finish()]));
+            self.capture.after_submit();
+            self.passes.terrain.after_submit();
+            self.passes.timer.after_submit();
+            self.queue.present(surface_texture);
+        }
+
+        FrameStatus::Presented
+    }
+}
+
+/// The passes that render the scene into the swapchain's scene view, in frame order (cull,
+/// terrain G-buffer, atmosphere LUTs, lighting, tonemap), with their targets and timer; egui and
+/// the capture stay with the [`Renderer`]. Separate from the surface so a test can run the
+/// renderer's real frame headless.
+pub(crate) struct FramePasses {
+    targets: FrameTargets,
+    terrain: terrain::TerrainPass,
+    atmosphere: atmosphere::AtmospherePass,
+    post: post::PostPass,
+    timer: timing::GpuTimer,
+}
+
+impl FramePasses {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        (width, height): (u32, u32),
+        pools: TerrainPoolConfig,
+        scene_format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            targets: FrameTargets::new(device, width, height),
+            terrain: terrain::TerrainPass::new(device, queue, pools),
+            atmosphere: atmosphere::AtmospherePass::new(device, queue),
+            post: post::PostPass::new(device, scene_format),
+            timer: timing::GpuTimer::new(device, queue),
+        }
+    }
+
+    /// Writes the frame's uniforms and encodes every scene pass, ending in the tonemap into
+    /// `scene_view`. The timer's frame is begun by the caller and ended after any later pass.
+    fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameInput,
+        scene_view: &wgpu::TextureView,
+    ) {
+        let (width, height) = self.targets.size;
+        self.terrain.prepare_frame(device, queue, frame);
+        self.atmosphere.prepare_frame(queue, frame, width, height);
+        self.post.prepare_frame(queue, frame);
+
+        // The cull pass opens its own untimed compute passes; it is timed from a marker pass to
+        // the start of the terrain pass, which depends on its indirect arguments.
+        let cull_start = self.timer.marker(encoder);
+        self.terrain.encode_cull(encoder);
+        self.timer.span_to_next("cull", cull_start);
 
         {
             profiling::scope!("terrain pass");
@@ -698,67 +838,18 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.timer.render_writes("terrain"),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
         }
-        self.terrain.encode_readback(&mut encoder);
-        self.atmosphere.encode_luts(&mut encoder);
+        self.terrain.encode_readback(encoder);
+        self.atmosphere.encode_luts(encoder, &mut self.timer);
         self.atmosphere
-            .encode_lighting(&self.device, &mut encoder, &self.targets);
+            .encode_lighting(device, encoder, &self.targets, &mut self.timer);
         self.post
-            .encode_tonemap(&self.device, &mut encoder, &self.targets.hdr, &scene_view);
-
-        let mut extra_buffers = Vec::new();
-        if let Some(ui) = &frame.egui {
-            profiling::scope!("egui pass");
-            let screen = egui_wgpu::ScreenDescriptor {
-                size_in_pixels: [self.config.width, self.config.height],
-                pixels_per_point: ui.pixels_per_point,
-            };
-            extra_buffers = self.egui.update_buffers(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                ui.primitives,
-                &screen,
-            );
-            let mut pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("egui"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &ui_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                })
-                .forget_lifetime();
-            self.egui.render(&mut pass, ui.primitives, &screen);
-        }
-
-        self.capture
-            .encode_copy(&self.device, &mut encoder, &surface_texture.texture);
-
-        {
-            profiling::scope!("submit and present");
-            self.queue
-                .submit(extra_buffers.into_iter().chain([encoder.finish()]));
-            self.capture.after_submit();
-            self.terrain.after_submit();
-            self.queue.present(surface_texture);
-        }
-
-        FrameStatus::Presented
+            .encode_tonemap(device, encoder, &self.targets, scene_view, &mut self.timer);
     }
 }
 
@@ -769,12 +860,15 @@ pub(crate) struct FrameTargets {
     pub(crate) normal: wgpu::TextureView,
     pub(crate) depth: wgpu::TextureView,
     pub(crate) hdr: wgpu::TextureView,
+    /// Unique per instance, so passes caching bind groups of these views rebuild them on resize.
+    pub(crate) generation: u64,
+    pub(crate) size: (u32, u32),
 }
 
 impl FrameTargets {
     fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let view = |label, format| {
+        let view = |label, format, extra: wgpu::TextureUsages| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
@@ -787,16 +881,183 @@ impl FrameTargets {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage,
+                    usage: usage | extra,
                     view_formats: &[],
                 })
                 .create_view(&wgpu::TextureViewDescriptor::default())
         };
+        let none = wgpu::TextureUsages::empty();
         Self {
-            albedo: view("gbuffer albedo", GBUFFER_ALBEDO_FORMAT),
-            normal: view("gbuffer normal", GBUFFER_NORMAL_FORMAT),
-            depth: view("depth", DEPTH_FORMAT),
-            hdr: view("hdr", HDR_FORMAT),
+            albedo: view("gbuffer albedo", GBUFFER_ALBEDO_FORMAT, none),
+            normal: view("gbuffer normal", GBUFFER_NORMAL_FORMAT, none),
+            depth: view("depth", DEPTH_FORMAT, none),
+            // Copyable for readbacks of the lit frame in tests and debugging.
+            hdr: view("hdr", HDR_FORMAT, wgpu::TextureUsages::COPY_SRC),
+            generation: atmosphere::next_targets_generation(),
+            size: (width, height),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::atmosphere::tests::{frame_input, headless_device};
+    use vx_core::VertexAttributes;
+
+    fn read_rgba8(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<u8> {
+        let (w, h) = (texture.width(), texture.height());
+        let bytes_per_row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame readback"),
+            size: u64::from(bytes_per_row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        buffer.map_async(wgpu::MapMode::Read, .., |r| r.expect("map"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = buffer.get_mapped_range(..).expect("mapped");
+        data.chunks_exact(bytes_per_row as usize)
+            .flat_map(|row| row[..(w * 4) as usize].to_vec())
+            .collect()
+    }
+
+    /// The renderer's own frame (the passes of `Renderer::draw` without the surface and egui):
+    /// a terrain quad through cull and the G-buffer, the atmosphere and the tonemap, with every
+    /// pass timed when the adapter has timestamps.
+    #[test]
+    fn the_renderer_frame_runs_every_pass_headless() {
+        let Some((device, queue)) = headless_device(wgpu::Features::TIMESTAMP_QUERY) else {
+            eprintln!(
+                "no GPU adapter available, skipping the_renderer_frame_runs_every_pass_headless"
+            );
+            return;
+        };
+        let (width, height) = (320, 180);
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let pools = TerrainPoolConfig {
+            vertex_bytes: 1 << 16,
+            index_bytes: 1 << 16,
+        };
+        let mut passes = FramePasses::new(&device, &queue, (width, height), pools, format);
+        let vertex = |x: f32, y: f32| {
+            PackedVertex::pack(&VertexAttributes {
+                position_voxels: Vec3::new(x, y, 16.0),
+                normal: Vec3::Z,
+                materials: [(3, 15), (0, 0), (0, 0), (0, 0)],
+            })
+        };
+        let vertices = [
+            vertex(0.0, 0.0),
+            vertex(32.0, 0.0),
+            vertex(32.0, 32.0),
+            vertex(0.0, 32.0),
+        ];
+        let indices = [0, 1, 2, 0, 2, 3];
+        passes
+            .terrain
+            .upload_mesh(
+                &queue,
+                &MeshUpload {
+                    vertices: &vertices,
+                    indices: &indices,
+                    regular_index_count: 6,
+                    transition_index_counts: [0; 6],
+                },
+                ChunkPlacement {
+                    offset_m: Vec3::new(-16.0, -16.0, -60.0),
+                    texture_phase_m: Vec3::ZERO,
+                    voxel_size_m: 1.0,
+                    transition_mask: 0,
+                    visible: true,
+                },
+            )
+            .expect("upload");
+        let display = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("display"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = display.create_view(&Default::default());
+        let frame = frame_input(
+            10_000.0,
+            30.0,
+            Vec3::new(0.3, 0.8, 0.5),
+            Vec3::new(0.0, 0.0, -1.0),
+            width,
+            height,
+        );
+        let mut timed: Vec<&'static str> = Vec::new();
+        for _ in 0..4 {
+            passes.timer.begin_frame(&device);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            passes.encode(&device, &queue, &mut encoder, &frame, &view);
+            passes.timer.end_frame(&mut encoder);
+            queue.submit([encoder.finish()]);
+            passes.terrain.after_submit();
+            passes.timer.after_submit();
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+            passes.timer.poll(&device);
+            if let Some(timings) = passes.timer.timings() {
+                for (name, ms) in timings.passes {
+                    assert!(ms.is_finite() && ms >= 0.0, "{name} {ms}");
+                    if !timed.contains(&name) {
+                        timed.push(name);
+                    }
+                }
+            }
+        }
+        if passes.timer.supported() {
+            for name in [
+                "cull",
+                "terrain",
+                "transmittance lut",
+                "multiple scattering lut",
+                "sky view lut",
+                "aerial perspective lut",
+                "lighting",
+                "tonemap",
+            ] {
+                assert!(timed.contains(&name), "{name} timed: {timed:?}");
+            }
+        }
+        let rgba = read_rgba8(&device, &queue, &display);
+        let px = |x: u32, y: u32| {
+            let i = ((y * width + x) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2]]
+        };
+        let sky = px(4, 4);
+        let quad = px(width / 2, height / 2);
+        assert!(sky[2] > sky[0], "sky is blue: {sky:?}");
+        assert_ne!(quad, sky, "the terrain quad is drawn and lit");
+        assert!(quad.iter().any(|&c| c > 20), "the quad is lit: {quad:?}");
     }
 }
