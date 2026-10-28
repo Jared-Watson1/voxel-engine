@@ -29,10 +29,11 @@ impl SimClock {
         self.paused
     }
 
-    /// Sets the warp factor (simulated seconds per real second, at least 0).
+    /// Sets the warp factor (simulated seconds per real second, at least 0). Negative values clamp
+    /// to 0; a non finite value (NaN or infinity) sets 0 so the clock can never reach a non finite
+    /// time.
     pub fn set_warp(&mut self, warp: f64) {
-        let _ = warp;
-        todo!("workstream A")
+        self.warp = if warp.is_finite() { warp.max(0.0) } else { 0.0 };
     }
 
     pub fn set_paused(&mut self, paused: bool) {
@@ -44,9 +45,70 @@ impl SimClock {
         self.time_s = time_s;
     }
 
-    /// Advances by `real_dt_s` of real time and returns the simulated seconds that passed.
+    /// Advances by `real_dt_s` of real time and returns the simulated seconds that passed: 0 while
+    /// paused, and 0 for a negative or non finite `real_dt_s` (simulation time never runs
+    /// backwards through `advance`; `set_time_s` is the way to jump).
     pub fn advance(&mut self, real_dt_s: f64) -> f64 {
-        let _ = real_dt_s;
-        todo!("workstream A")
+        if self.paused || !real_dt_s.is_finite() || real_dt_s <= 0.0 {
+            return 0.0;
+        }
+        let dt_s = real_dt_s * self.warp;
+        self.time_s += dt_s;
+        dt_s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_scales_real_time_by_the_warp() {
+        let mut clock = SimClock::new(10.0);
+        assert_eq!(clock.advance(0.5), 0.5);
+        assert_eq!(clock.time_s(), 10.5);
+        clock.set_warp(1000.0);
+        assert_eq!(clock.advance(0.25), 250.0);
+        assert_eq!(clock.time_s(), 260.5);
+    }
+
+    #[test]
+    fn paused_clock_does_not_move() {
+        let mut clock = SimClock::new(0.0);
+        clock.set_warp(100.0);
+        clock.set_paused(true);
+        assert_eq!(clock.advance(1.0), 0.0);
+        assert_eq!(clock.time_s(), 0.0);
+        clock.set_paused(false);
+        assert_eq!(clock.advance(1.0), 100.0);
+    }
+
+    #[test]
+    fn warp_is_clamped_and_finite() {
+        let mut clock = SimClock::new(0.0);
+        clock.set_warp(-3.0);
+        assert_eq!(clock.warp(), 0.0);
+        clock.set_warp(f64::NAN);
+        assert_eq!(clock.warp(), 0.0);
+        clock.set_warp(f64::INFINITY);
+        assert_eq!(clock.warp(), 0.0);
+        clock.set_warp(0.0);
+        assert_eq!(clock.advance(1.0), 0.0);
+    }
+
+    #[test]
+    fn bad_real_time_steps_are_ignored() {
+        let mut clock = SimClock::new(5.0);
+        assert_eq!(clock.advance(-1.0), 0.0);
+        assert_eq!(clock.advance(f64::NAN), 0.0);
+        assert_eq!(clock.advance(f64::INFINITY), 0.0);
+        assert_eq!(clock.time_s(), 5.0);
+    }
+
+    #[test]
+    fn set_time_jumps() {
+        let mut clock = SimClock::new(0.0);
+        clock.set_time_s(-42.0);
+        assert_eq!(clock.time_s(), -42.0);
     }
 }
