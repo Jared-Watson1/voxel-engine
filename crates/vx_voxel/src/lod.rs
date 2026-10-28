@@ -54,8 +54,9 @@ use crate::key::{ChunkKey, Face};
 /// the request burst of a large camera jump, which then settles over several updates.
 pub const MAX_SPLIT_STARTS_PER_UPDATE: usize = 64;
 
-/// Most merges committed in one update.
-pub const MAX_MERGES_PER_UPDATE: usize = 128;
+/// Most merges committed in one update; each hides and releases up to eight children. At 64 a
+/// teleport across the 10 km planet stays near 0.5 ms per update while the old side unwinds.
+pub const MAX_MERGES_PER_UPDATE: usize = 64;
 
 /// Octree parameters, from [`WorldConfig`] and the planet's shell.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1615,28 +1616,38 @@ mod tests {
     /// Update time at the design defaults; meaningful with `cargo test --release`.
     #[test]
     fn update_time_at_the_defaults() {
-        let params = defaults_10km();
+        measure_update_time(defaults_10km(), 10_000.0, "10 km");
+    }
+
+    /// Update time of the 50 km, 0.5 m run.
+    #[test]
+    fn update_time_at_50_km() {
+        measure_update_time(params_50km(), 50_000.0, "50 km");
+    }
+
+    fn measure_update_time(params: LodParams, radius_m: f64, label: &str) {
+        let r = radius_m + 2.0;
         let dir = descent_dir();
         let tangent = dir.cross(DVec3::Y).normalize();
         let mut sim = Sim::new(params, false);
         let quick = cfg!(debug_assertions);
         let steps = if quick { 60 } else { 300 };
         for i in 0..=steps {
-            sim.step(dir * (10_000.0 + altitude(i, steps)));
+            sim.step(dir * (radius_m + altitude(i, steps)));
         }
-        sim.settle(dir * 10_002.0, 600);
+        sim.settle(dir * r, 600);
         let descent: Vec<f64> = std::mem::take(&mut sim.update_ms);
         for _ in 0..if quick { 10 } else { 120 } {
-            sim.step(dir * 10_002.0);
+            sim.step(dir * r);
         }
         let standing: Vec<f64> = std::mem::take(&mut sim.update_ms);
         // 100 m/s at 60 updates per second along the surface.
         for i in 0..if quick { 60 } else { 1200 } {
-            let p = dir * 10_002.0 + tangent * (i as f64 * 100.0 / 60.0);
-            sim.step(p.normalize() * 10_002.0);
+            let p = dir * r + tangent * (i as f64 * 100.0 / 60.0);
+            sim.step(p.normalize() * r);
         }
         let walking: Vec<f64> = std::mem::take(&mut sim.update_ms);
-        sim.settle(-dir * 10_002.0, 600);
+        sim.settle(-dir * r, 600);
         let teleport: Vec<f64> = std::mem::take(&mut sim.update_ms);
         let summary = |v: &[f64]| {
             let mut sorted = v.to_vec();
@@ -1650,7 +1661,7 @@ mod tests {
         } else {
             "release"
         };
-        for (label, v) in [
+        for (phase, v) in [
             ("descent", &descent),
             ("standing", &standing),
             ("walking 100 m/s", &walking),
@@ -1658,12 +1669,12 @@ mod tests {
         ] {
             let (mean, median, p99, max) = summary(v);
             println!(
-                "LOD update {build} {label} ({} updates): mean {mean:.4} median {median:.4} \
+                "LOD update {build} {label} {phase} ({} updates): mean {mean:.4} median {median:.4} \
                  p99 {p99:.4} max {max:.4} ms",
                 v.len()
             );
         }
-        describe("defaults standing", &sim.tree);
+        describe(&format!("{label} after teleport"), &sim.tree);
         // Medians, because other processes preempting the test show up as rare spikes.
         if !cfg!(debug_assertions) {
             assert!(summary(&standing).1 < 0.5);
