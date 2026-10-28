@@ -22,13 +22,13 @@ impl Material {
     pub const SOIL: Self = Self(2);
     pub const GRASS: Self = Self(3);
     pub const SAND: Self = Self(4);
-    /// Snow above the snow line (M2). Workstream B adds its texture layer and raises `COUNT`.
+    /// Snow above the snow line (M2).
     pub const SNOW: Self = Self(5);
     /// Largest id the vertex format carries.
     pub const MAX_ID: u8 = vx_core::mesh::MAX_MATERIAL_ID;
     /// Number of material ids with a texture layer, air included; texture arrays have this many
     /// layers.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     pub fn name(self) -> &'static str {
         match self {
