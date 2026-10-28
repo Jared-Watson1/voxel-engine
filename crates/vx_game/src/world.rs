@@ -231,7 +231,7 @@ impl World {
     /// True once nothing is requested, queued or uploading, so measurements can start from a
     /// settled state.
     pub fn is_settled(&self) -> bool {
-        self.stats.lod.pending == 0
+        self.lod.is_settled()
             && self.uploads.is_empty()
             && self.jobs.queued_total() == 0
             && self.jobs.all_stats().iter().all(|s| s.running == 0)
@@ -374,8 +374,13 @@ impl World {
                 for brush in edits.iter() {
                     brush.apply(&mut chunk);
                 }
-                let has_surface = chunk.has_surface();
                 let store = ChunkStore::compress(&chunk);
+                // A coarse chunk near the surface but without a sign change of its own can still
+                // need transition or bridge geometry where a finer neighbour's surface meets its
+                // face (D26); only a uniform block (every sample clamped far from the surface)
+                // is skipped.
+                let has_surface =
+                    chunk.has_surface() || (key.level > 0 && store.uniform().is_none());
                 if token.is_cancelled() {
                     return;
                 }

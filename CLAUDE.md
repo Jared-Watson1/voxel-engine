@@ -49,7 +49,7 @@ Versions are the latest stable on crates.io when added (2026-10-26). All pure Ru
 | puffin, puffin_http | 0.20.0, 0.17.0 | MIT OR Apache-2.0 | vx_game (`profile` feature) | profiler backend and server; tracy-client was not used because it compiles C++ | M0 |
 | notify | 8.2.1 | CC0-1.0 | vx_core | file watching for shader and config hot reload (9.0 is a release candidate) | M0 |
 | serde, ron | 1.0.229, 0.12.2 | MIT OR Apache-2.0 | vx_core, vx_game | `WorldConfig` and scene config files (D11) | M0 |
-| transvoxel | 2.0.0 | MIT OR Apache-2.0 | vx_voxel | Transvoxel regular cells now, transition cells in M2 (D2); pulls `transvoxel-data` 0.2.1 (MIT on crates.io; the vault still lists the license of Lengyel's original tables as unverified), `num` 0.4 and `flagset` 0.4 (Apache-2.0) | M0 |
+| transvoxel-data | 0.2.1 | MIT | vx_voxel | Lengyel's Transvoxel cell tables for the vendored extraction in `vx_voxel::transvoxel` (D22, D26); the `transvoxel` 2.0.0 crate itself was removed in M2 (its extraction is vendored with attribution, MIT OR Apache-2.0); the vault still lists the license of Lengyel's original tables as unverified | M2 |
 | png | 0.18.1 | MIT OR Apache-2.0 | vx_game | screenshot encoding on a worker thread | M0 |
 | fastnoise-lite | 1.1.1 | MIT | vx_worldgen | OpenSimplex2 and fBm noise, pure safe Rust, no transcendentals, `f64` input feature; deterministic across machines (D13); pulls only `num-traits` | M1 |
 
