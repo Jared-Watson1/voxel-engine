@@ -312,7 +312,9 @@ fn assert_full_res_faces_match(coarse: &Meshed, fine: &[Meshed], base_m: f64, wh
         }
         let mut on_face: BTreeSet<VertexKey> = BTreeSet::new();
         for f in fine {
-            for (i, p) in f.displaced_m.iter().enumerate() {
+            let drawn: BTreeSet<u32> = f.triangles().into_iter().flatten().collect();
+            for i in drawn.into_iter().map(|i| i as usize) {
+                let p = f.displaced_m[i];
                 let in_rect = (0..3).all(|a| a == axis || (p[a] >= lo[a] && p[a] <= hi[a]));
                 if p[axis] == plane && in_rect {
                     on_face.insert(vertex_key(f, i));
@@ -684,6 +686,13 @@ fn transition_meets_same_level_face_without_a_gap() {
                 Box::new(perturbed(base_m, noisy_plane(base_m, 7), 0.5)),
                 "perturbed noise",
             ),
+            (
+                // Coarse samples on the plane z = 20 (coarse units) flip against the fine ones on
+                // both A's and D's transition faces, so bridges of two chunks on perpendicular
+                // faces meet on the line.
+                Box::new(move |_: u8, p: DVec3| (p.z - 40.02 * base_m, Material::ROCK)),
+                "flip plane",
+            ),
         ];
         for (field, name) in fields {
             let mut all = vec![
@@ -709,6 +718,9 @@ fn transition_meets_same_level_face_without_a_gap() {
                 }
             }
             let what = format!("line {name} at {base_m} m");
+            if name == "flip plane" {
+                assert!(all[0].flips() > 0 && all[2].flips() > 0, "{what}: no flips");
+            }
             let report = watertight(&all, base_m);
             let line_x = 64.0 * base_m;
             for &(pa, pb, _) in &report.unmatched {
@@ -748,6 +760,49 @@ fn transition_meets_same_level_face_without_a_gap() {
         "transition and same level line: gap {worst_gap_m} m, {sliver_edges} edges along the line"
     );
     assert_eq!(worst_gap_m, 0.0);
+}
+
+/// The closed sphere scenes at levels 3 and 2, about 23 km from the frame origin at 0.3 m voxels:
+/// positions stay bit equal in metres at the levels and distances the planet uses.
+#[test]
+fn deeper_levels_far_from_the_origin_stay_closed() {
+    let base_m = 0.3;
+    let coarse_key = ChunkKey::at_level(3, 300, -301, 77);
+    let voxel_m = coarse_key.voxel_size_m(base_m);
+    let origin_m = coarse_key.bounds_m(base_m).0;
+    for (mask, name) in masks() {
+        let local = closed_spheres(mask, 1.0);
+        // The scene's fields in coarse units of the level 1 scene at 1 m map onto this chunk.
+        let field = move |level: u8, p: DVec3| {
+            let c = (p - origin_m) / voxel_m * 2.0;
+            let (d, m) = local(level, c);
+            (d * voxel_m * 0.5, m)
+        };
+        let coarse = Meshed::new(coarse_key, mask, base_m, &field);
+        let fine: Vec<Meshed> = fine_shell(mask)
+            .into_iter()
+            .map(|k| {
+                let key = ChunkKey::at_level(
+                    2,
+                    2 * coarse_key.x + k.x,
+                    2 * coarse_key.y + k.y,
+                    2 * coarse_key.z + k.z,
+                );
+                Meshed::new(key, 0, base_m, &field)
+            })
+            .collect();
+        let what = format!("level 3 sphere {name}");
+        let crossed = assert_full_res_faces_match(&coarse, &fine, base_m, &what);
+        assert_eq!(
+            crossed,
+            mask.count_ones() as usize,
+            "{what}: a face is not crossed"
+        );
+        let mut all = fine;
+        all.push(coarse);
+        let report = assert_watertight(&all, base_m, &what);
+        assert_eq!(report.boundary_edges, 0, "{what}: the sphere is not closed");
+    }
 }
 
 /// Meshing time with and without all six transition faces on a level 1 surface chunk. Read it

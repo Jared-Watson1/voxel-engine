@@ -2,7 +2,7 @@
 //! Simulations", chapter 4), vendored for D22.
 //!
 //! Derived from the `transvoxel` crate 2.0.0 by Seb E. (<https://github.com/Gnurfos/transvoxel_rs>),
-//! licensed MIT OR Apache-2.0: the regular and transition cell walks of
+//! Copyright (c) 2021+ SE/G, licensed MIT OR Apache-2.0: the regular and transition cell walks of
 //! `src/implementation/algorithm.rs`, the case bit layout and grid point numbering of
 //! `src/implementation/aux_tables.rs` and the per face frames of `ROTATIONS`. The cell tables come
 //! from the `transvoxel-data` 0.2.1 dependency (MIT, Lengyel's tables). Changed from the crate:
