@@ -96,9 +96,18 @@ pub(crate) fn node_grid_coordinate(i: i32, n: i32) -> f64 {
 }
 
 /// Unit direction of node `(i, j)` of `face` on a grid of `n` cells per edge.
+#[cfg(test)]
 pub(crate) fn node_direction(face: CubeFace, n: i32, i: i32, j: i32) -> DVec3 {
-    let x = gnomonic_from_grid(node_grid_coordinate(i, n));
-    let y = gnomonic_from_grid(node_grid_coordinate(j, n));
+    node_direction_from(
+        face,
+        gnomonic_from_grid(node_grid_coordinate(i, n)),
+        gnomonic_from_grid(node_grid_coordinate(j, n)),
+    )
+}
+
+/// Unit direction of gnomonic coordinates `(x, y)` on `face`.
+#[inline]
+pub(crate) fn node_direction_from(face: CubeFace, x: f64, y: f64) -> DVec3 {
     let (major, sign, u, v) = face_axes(face);
     let mut q = DVec3::ZERO;
     q[major] = sign;
@@ -107,11 +116,10 @@ pub(crate) fn node_direction(face: CubeFace, n: i32, i: i32, j: i32) -> DVec3 {
     q * (1.0 / (1.0 + x * x + y * y).sqrt())
 }
 
-/// Cells per face edge for a grid whose largest node spacing at `radius_m` is at most
-/// `spacing_m`, at least 2.
+/// Cells per face edge for a grid whose mean node spacing at `radius_m` is at most `spacing_m`
+/// (the quarter great circle over the cell count), at least 2.
 pub(crate) fn cells_per_edge(radius_m: f64, spacing_m: f64) -> i32 {
-    let mean_cells = std::f64::consts::FRAC_PI_2 * radius_m / spacing_m;
-    let cells = (SPACING_MAX_OVER_MEAN * mean_cells).ceil();
+    let cells = (std::f64::consts::FRAC_PI_2 * radius_m / spacing_m).ceil();
     // Saturating float to int conversion; i32::MAX / 4 keeps `2 * i - n` and the tile arithmetic
     // in range for any configuration.
     (cells as i32).clamp(2, i32::MAX / 4)
@@ -196,14 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn cells_per_edge_keeps_the_largest_spacing_under_the_target() {
+    fn cells_per_edge_keeps_the_mean_spacing_under_the_target() {
         for (radius_m, spacing_m) in [(10_000.0, 1.0), (10_000.0, 128.0), (1000.0, 4096.0)] {
             let n = cells_per_edge(radius_m, spacing_m);
-            let largest =
-                SPACING_MAX_OVER_MEAN * std::f64::consts::FRAC_PI_2 * radius_m / f64::from(n);
+            let mean = std::f64::consts::FRAC_PI_2 * radius_m / f64::from(n);
             assert!(
-                largest <= spacing_m * (1.0 + 1e-12),
-                "{radius_m} {spacing_m}: {largest}"
+                mean <= spacing_m * (1.0 + 1e-12),
+                "{radius_m} {spacing_m}: {mean}"
             );
             assert!(n >= 2);
         }

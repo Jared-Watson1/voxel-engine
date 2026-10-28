@@ -213,7 +213,8 @@ fn measure(sampler: &PlanetSampler, config: &WorldConfig, key: ChunkKey, out: &m
 fn report(planet: &PlanetParams, config: &WorldConfig, level: u8, cache: &str, s: &mut Samples) {
     let row = |name: &str, v: &mut Vec<f64>| {
         println!(
-            "  {cache} {name:<9} median {:.3} ms  p95 {:.3} ms  max {:.3} ms",
+            "  {cache} {name:<9} min {:.3} ms  median {:.3} ms  p95 {:.3} ms  max {:.3} ms",
+            percentile(v, 0.0),
             percentile(v, 0.5),
             percentile(v, 0.95),
             percentile(v, 1.0)

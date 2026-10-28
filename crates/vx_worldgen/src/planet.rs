@@ -8,8 +8,9 @@ use vx_voxel::{
 
 use crate::cache::{DEFAULT_CAPACITY_TILES, HeightCacheStats, TILE, Tile, TileCache, TileKey};
 use crate::cubemap::{
-    CubeFace, cells_per_edge, face_of, gnomonic_on, grid_derivative, grid_from_gnomonic,
-    map_inv_denominator, node_direction,
+    CubeFace, SPACING_MAX_OVER_MEAN, cells_per_edge, face_of, gnomonic_from_grid, gnomonic_on,
+    grid_derivative, grid_from_gnomonic, map_inv_denominator, node_direction_from,
+    node_grid_coordinate,
 };
 use crate::height::HeightNoise;
 
@@ -36,13 +37,14 @@ const BRICK: u32 = 8;
 
 /// Node indices added on each side of a footprint, covering rounding differences between the
 /// corner projections and the per sample projection.
-const FOOTPRINT_PAD: i32 = 2;
+const FOOTPRINT_PAD: i32 = 1;
 
 /// Largest node window gathered per fill; larger footprints (coarse chunks spanning a large part
 /// of a face) read nodes through the cache per sample instead.
 const MAX_WINDOW_NODES: i64 = 1 << 18;
 
-/// The octree's deepest possible level (`WorldConfig::LOD_LEVELS_RANGE`), for [`PlanetSampler::shell_m`].
+/// The octree's deepest possible level (`WorldConfig::LOD_LEVELS_RANGE`), for
+/// [`PlanetSampler::shell_m`].
 const MAX_LEVEL: u8 = (*WorldConfig::LOD_LEVELS_RANGE.end() - 1) as u8;
 
 const N: u32 = SAMPLES_PER_AXIS as u32;
@@ -62,13 +64,14 @@ pub enum ChunkClass {
 /// `h(dir)` is seeded fBm of the unit direction times the radius, evaluated on a per level cube
 /// sphere node grid and interpolated, so a chunk never evaluates the height noise per sample.
 ///
-/// At level `L` the grid's node spacing at the mean radius is at most the level's voxel size
-/// (`base_voxel_size_m * 2^L`), the nodes are the fBm without the octaves shorter than two voxel
-/// sizes, the height between nodes is the Catmull-Rom (bicubic) interpolant of the 4 x 4 nodes
-/// around it, and the detail noise is dropped once its wavelength is shorter than two voxel
-/// sizes. The signed distance is `(|p| - R - h) * slope_factor + detail(p)`, where the slope is
-/// the interpolant's gradient against the radial up. The cube sphere mapping is documented in the
-/// `cubemap` module.
+/// At level `L` the grid's mean node spacing at the mean radius is the level's voxel size
+/// (`base_voxel_size_m * 2^L`, rounded down to a whole number of cells per face edge; the local
+/// spacing lies within 0.72 and 1.083 times the mean). The nodes are the fBm without the octaves
+/// shorter than two of the largest node spacings, the height between nodes is the Catmull-Rom
+/// (bicubic) interpolant of the 4 x 4 nodes around it, and the detail noise is dropped once its
+/// wavelength is shorter than two voxel sizes. The signed distance is
+/// `(|p| - R - h) * slope_factor + detail(p)`, where the slope is the interpolant's gradient
+/// against the radial up. The cube sphere mapping is documented in the `cubemap` module.
 ///
 /// Every method is a pure function of its arguments, the seed, the parameters and the level 0
 /// voxel size: the shared height cache changes speed, never results (engineering rule 2). No
@@ -140,6 +143,8 @@ struct Evaluated {
 struct Thresholds {
     air_m: f64,
     rock_m: f64,
+    /// Lower bound of the slope factor of every sample of the box.
+    slope_factor_min: f64,
 }
 
 /// Dense node heights of one face over an index range, gathered once per fill.
@@ -220,24 +225,54 @@ fn catmull_rom_weights(t: f64) -> ([f64; 4], [f64; 4]) {
     )
 }
 
-/// Value and derivatives per grid unit along i and j of the Catmull-Rom patch over `nodes` (row
-/// `jj` holds nodes `i - 1 + ii`, `j - 1 + jj`) at fractions `s` along i and `t` along j.
-#[inline(always)]
-fn catmull_rom(nodes: &[f64; 16], s: f64, t: f64) -> (f64, f64, f64) {
-    let (ws, dws) = catmull_rom_weights(s);
-    let (wt, dwt) = catmull_rom_weights(t);
-    let mut h = 0.0;
-    let mut hs = 0.0;
-    let mut ht = 0.0;
-    for jj in 0..4 {
-        let r = &nodes[jj * 4..jj * 4 + 4];
-        let value = ws[0] * r[0] + ws[1] * r[1] + ws[2] * r[2] + ws[3] * r[3];
-        let along = dws[0] * r[0] + dws[1] * r[1] + dws[2] * r[2] + dws[3] * r[3];
-        h += wt[jj] * value;
-        hs += wt[jj] * along;
-        ht += dwt[jj] * value;
+/// A Catmull-Rom patch over 4 x 4 nodes (row `jj` holds nodes `i - 1 + ii`, `j - 1 + jj`) at
+/// fractions `s` along i and `t` along j: the value first, the derivatives on demand.
+struct Patch {
+    nodes: [f64; 16],
+    dws: [f64; 4],
+    wt: [f64; 4],
+    dwt: [f64; 4],
+    /// `ws` applied to each row.
+    rows: [f64; 4],
+    h: f64,
+}
+
+impl Patch {
+    #[inline(always)]
+    fn new(nodes: [f64; 16], s: f64, t: f64) -> Self {
+        let (ws, dws) = catmull_rom_weights(s);
+        let (wt, dwt) = catmull_rom_weights(t);
+        let mut rows = [0.0; 4];
+        let mut h = 0.0;
+        for jj in 0..4 {
+            let r = &nodes[jj * 4..jj * 4 + 4];
+            rows[jj] = ws[0] * r[0] + ws[1] * r[1] + ws[2] * r[2] + ws[3] * r[3];
+            h += wt[jj] * rows[jj];
+        }
+        Self {
+            nodes,
+            dws,
+            wt,
+            dwt,
+            rows,
+            h,
+        }
     }
-    (h, hs, ht)
+
+    /// Derivatives per grid unit along i and along j.
+    #[inline(always)]
+    fn gradient(&self) -> (f64, f64) {
+        let mut hs = 0.0;
+        let mut ht = 0.0;
+        for jj in 0..4 {
+            let r = &self.nodes[jj * 4..jj * 4 + 4];
+            let along =
+                self.dws[0] * r[0] + self.dws[1] * r[1] + self.dws[2] * r[2] + self.dws[3] * r[3];
+            hs += self.wt[jj] * along;
+            ht += self.dwt[jj] * self.rows[jj];
+        }
+        (hs, ht)
+    }
 }
 
 #[inline(always)]
@@ -441,8 +476,8 @@ impl PlanetSampler {
         let unit_m = voxel_size_m / f64::from(DISTANCE_UNITS_PER_VOXEL);
         let skip_m = f64::from(i8::MAX) * unit_m + unit_m;
         let cells = cells_per_edge(self.radius_m, voxel_size_m);
-        let min_wavelength_m = 2.0 * voxel_size_m;
-        let detail = self.noise.detail_wavelength_m() >= min_wavelength_m;
+        let largest_spacing_m = SPACING_MAX_OVER_MEAN * voxel_size_m;
+        let detail = self.noise.detail_wavelength_m() >= 2.0 * voxel_size_m;
         Level {
             level,
             voxel_size_m,
@@ -452,7 +487,7 @@ impl PlanetSampler {
             coarse_skip_m: skip_m + unit_m,
             cells,
             half_cells: 0.5 * f64::from(cells),
-            octaves: self.noise.octaves_at_least(min_wavelength_m),
+            octaves: self.noise.octaves_at_least(2.0 * largest_spacing_m),
             detail,
             detail_amplitude_m: if detail {
                 self.noise.detail_amplitude_m()
@@ -467,6 +502,7 @@ impl PlanetSampler {
         Thresholds {
             air_m: self.radius_m + h_hi + margin + self.slack_m,
             rock_m: self.radius_m + h_lo - margin.max(self.rock_depth_m + lv.unit_m) - self.slack_m,
+            slope_factor_min,
         }
     }
 
@@ -533,14 +569,21 @@ impl PlanetSampler {
         at: &Located,
         stencil: &mut impl FnMut(CubeFace, i32, i32) -> [f64; 16],
     ) -> Evaluated {
-        let r_sq = length_sq(p);
-        let nodes = stencil(at.face, at.i, at.j);
-        let (h_m, hs, ht) = catmull_rom(&nodes, at.s, at.t);
+        let patch = Patch::new(stencil(at.face, at.i, at.j), at.s, at.t);
+        self.finish(lv, length_sq(p), at, &patch)
+    }
+
+    /// Slope, slope factor and distance from an interpolated patch.
+    #[inline(always)]
+    fn finish(&self, lv: &Level, r_sq: f64, at: &Located, patch: &Patch) -> Evaluated {
+        let h_m = patch.h;
+        let (hs, ht) = patch.gradient();
         let hx = hs * lv.half_cells * grid_derivative(at.inv_dx);
         let hy = ht * lv.half_cells * grid_derivative(at.inv_dy);
         let (x, y) = (at.x, at.y);
         // Squared gradient on the unit sphere through the inverse metric of the gnomonic chart,
-        // `(1 + x^2 + y^2) [[1 + x^2, x y], [x y, 1 + y^2]]`, then per metre at the sample's radius.
+        // `(1 + x^2 + y^2) [[1 + x^2, x y], [x y, 1 + y^2]]`, then per metre at the sample's
+        // radius.
         let gradient_sq = (1.0 + x * x + y * y)
             * ((1.0 + x * x) * hx * hx + 2.0 * x * y * hx * hy + (1.0 + y * y) * hy * hy);
         let slope_sq = gradient_sq / r_sq.max(1.0);
@@ -580,14 +623,21 @@ impl PlanetSampler {
     fn tile(&self, lv: &Level, key: TileKey) -> Arc<Tile> {
         self.cache.get_or_compute(key, || {
             let mut tile = [0.0; TILE as usize * TILE as usize];
+            // Nodes beyond the ghost ring are never read; leaving them zero keeps the inverse map
+            // away from its pole at |a| = 5.
+            let ghost = -1..=lv.cells + 1;
+            let gnomonic = |k: i32| gnomonic_from_grid(node_grid_coordinate(k, lv.cells));
+            let xs: [f64; TILE as usize] =
+                std::array::from_fn(|ii| gnomonic(key.ti * TILE + ii as i32));
             for jj in 0..TILE {
                 let j = key.tj * TILE + jj;
+                if !ghost.contains(&j) {
+                    continue;
+                }
+                let y = gnomonic(j);
                 for ii in 0..TILE {
-                    let i = key.ti * TILE + ii;
-                    // Nodes beyond the ghost ring are never read; leaving them zero keeps the
-                    // inverse map away from its pole at |a| = 5.
-                    if (-1..=lv.cells + 1).contains(&i) && (-1..=lv.cells + 1).contains(&j) {
-                        let dir = node_direction(key.face, lv.cells, i, j);
+                    if ghost.contains(&(key.ti * TILE + ii)) {
+                        let dir = node_direction_from(key.face, xs[ii as usize], y);
                         tile[(jj * TILE + ii) as usize] = self.noise.height(dir, lv.octaves);
                     }
                 }
@@ -847,7 +897,7 @@ impl PlanetSampler {
                                 } else if r_sq <= rock_sq {
                                     Voxel::solid(Material::ROCK)
                                 } else {
-                                    self.sample_voxel(lv, p, &mut stencil)
+                                    self.sample_voxel(lv, p, t.slope_factor_min, &mut stencil)
                                 };
                             }
                         }
@@ -864,9 +914,24 @@ impl PlanetSampler {
         &self,
         lv: &Level,
         p: DVec3,
+        slope_factor_min: f64,
         stencil: &mut impl FnMut(CubeFace, i32, i32) -> [f64; 16],
     ) -> Voxel {
-        let e = self.evaluate(lv, p, stencil);
+        let r_sq = length_sq(p);
+        let at = self.locate(lv, p);
+        let patch = Patch::new(stencil(at.face, at.i, at.j), at.s, at.t);
+        // The slope factor lies in `slope_factor_min` to 1, so where the height alone puts the
+        // sample beyond the band (and deep enough for rock) the slope cannot change the result.
+        let above_m = (r_sq.sqrt() - self.radius_m) - patch.h;
+        if above_m * slope_factor_min - lv.detail_amplitude_m > lv.skip_m {
+            return Voxel::AIR;
+        }
+        if above_m * slope_factor_min + lv.detail_amplitude_m < -lv.skip_m
+            && -above_m >= self.rock_depth_m
+        {
+            return Voxel::solid(Material::ROCK);
+        }
+        let e = self.finish(lv, r_sq, &at, &patch);
         let distance_m = if lv.detail {
             if e.base_m - lv.detail_amplitude_m > lv.skip_m {
                 return Voxel::AIR;

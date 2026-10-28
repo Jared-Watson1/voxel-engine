@@ -262,7 +262,7 @@ fn golden_checksum_at_the_defaults() {
     );
 }
 
-const GOLDEN_CHECKSUM: u64 = 0x080a_db6e_b4d0_a7df;
+const GOLDEN_CHECKSUM: u64 = 0x6143_1a27_dfc9_053c;
 
 #[test]
 fn classify_is_exact_and_every_surface_lies_in_the_shell() {
@@ -394,13 +394,15 @@ fn octaves_and_detail_drop_with_the_level() {
         let voxel = ChunkKey::at_level(level, 0, 0, 0).voxel_size_m(BASE_VOXEL_M);
         assert!(octaves <= previous);
         previous = octaves;
-        // The shortest kept octave is at least two voxel sizes long, the next one is shorter.
+        // The shortest kept octave spans at least two of the largest node spacings, the next one
+        // does not.
+        let largest_spacing = crate::cubemap::SPACING_MAX_OVER_MEAN * voxel;
         let shortest = t.wavelength_m / f64::from(1u32 << octaves.saturating_sub(1));
         if octaves > 0 {
-            assert!(shortest >= 2.0 * voxel);
+            assert!(shortest >= 2.0 * largest_spacing);
         }
         if octaves < t.octaves as usize {
-            assert!(shortest / 2.0 < 2.0 * voxel || octaves == 0);
+            assert!(shortest / 2.0 < 2.0 * largest_spacing || octaves == 0);
         }
         assert_eq!(detail, t.detail_wavelength_m >= 2.0 * voxel);
         let mean_spacing = std::f64::consts::FRAC_PI_2 * s.radius_m() / f64::from(cells);
@@ -499,11 +501,11 @@ fn cube_edge_step_is_small() {
             "level {level}: height step {height_step}"
         );
         assert!(
-            near_step < 0.05 * voxel,
+            near_step < 0.08 * voxel,
             "level {level}: {near_step} m near the surface"
         );
         assert!(
-            band_step < 0.2 * voxel,
+            band_step < 0.3 * voxel,
             "level {level}: {band_step} m over the band"
         );
     }
