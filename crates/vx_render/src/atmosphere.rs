@@ -965,8 +965,28 @@ pub(crate) mod tests {
 
     #[test]
     fn coefficients_give_the_configured_zenith_optical_depths() {
-        let params = AtmosphereParams::default();
-        for radius_m in [10_000.0, 50_000.0] {
+        let fractions = AtmosphereParams::HEIGHT_FRACTION_RANGE;
+        let cases = [
+            (AtmosphereParams::default(), 10_000.0),
+            (AtmosphereParams::default(), 50_000.0),
+            (AtmosphereParams::default(), 1_000.0),
+            (AtmosphereParams::default(), 6_371_000.0),
+            (
+                AtmosphereParams {
+                    height_fraction: *fractions.start(),
+                    ..AtmosphereParams::default()
+                },
+                10_000.0,
+            ),
+            (
+                AtmosphereParams {
+                    height_fraction: *fractions.end(),
+                    ..AtmosphereParams::default()
+                },
+                10_000.0,
+            ),
+        ];
+        for (params, radius_m) in cases {
             let k = Coefficients::new(&params, radius_m);
             let depth = k.optical_depth_to_top(k.bottom_m, 1.0, TRANSMITTANCE_STEPS);
             let mie = params.mie_scattering_optical_depth + params.mie_absorption_optical_depth;
@@ -1319,6 +1339,68 @@ pub(crate) mod tests {
             "opacity grows: {near:?} {far:?}"
         );
         assert!(far[2] > near[2], "in-scattering grows: {near:?} {far:?}");
+    }
+
+    /// The radius independent LUT checks at both ends of the radius range (D11) and at the 50 km
+    /// configuration of the exit criteria: finite everywhere, a blue zenith, the transmittance 1
+    /// at the top and never decreasing upwards, and the GPU table matching the CPU reference.
+    #[test]
+    fn atmosphere_luts_across_the_radius_range() {
+        let Some((device, queue)) = headless_device(wgpu::Features::empty()) else {
+            eprintln!("no GPU adapter available, skipping atmosphere_luts_across_the_radius_range");
+            return;
+        };
+        let mut pass = AtmospherePass::new(&device, &queue);
+        let [tw, th] = TRANSMITTANCE_SIZE.map(|x| x as usize);
+        for radius_m in [1_000.0_f32, 50_000.0, 6_371_000.0] {
+            pass.set_params(&AtmosphereParams::default(), f64::from(radius_m));
+            let frame = frame_input(radius_m, 2.0, Vec3::new(0.4, 0.9, 0.2), Vec3::X, 64, 64);
+            run_luts(&device, &queue, &mut pass, &frame);
+            for (name, view) in [
+                ("transmittance", &pass.luts.transmittance.view),
+                ("multiple scattering", &pass.luts.multi_scattering.view),
+                ("irradiance", &pass.luts.irradiance.view),
+                ("sky view", &pass.luts.sky_view.view),
+                ("aerial perspective", &pass.luts.aerial.view),
+            ] {
+                let texels = read_lut(&device, &queue, view);
+                assert!(
+                    texels
+                        .iter()
+                        .all(|c| c.iter().all(|v| v.is_finite() && *v >= 0.0)),
+                    "{name} LUT finite and non negative at radius {radius_m}"
+                );
+            }
+            let sky = read_lut(&device, &queue, &pass.luts.sky_view.view);
+            let zenith = sky[0];
+            assert!(
+                zenith[2] > zenith[1] && zenith[1] > zenith[0] && zenith[0] > 0.0,
+                "zenith sky is blue at radius {radius_m}: {zenith:?}"
+            );
+            let transmittance = read_lut(&device, &queue, &pass.luts.transmittance.view);
+            let column: Vec<f32> = (0..th).map(|row| transmittance[row * tw][2]).collect();
+            assert!(
+                column[th - 1] > 0.999,
+                "radius {radius_m}: top {}",
+                column[th - 1]
+            );
+            assert!(column.windows(2).all(|w| w[0] <= w[1] + 1.0e-3));
+            let k = pass.coefficients();
+            for (x, y) in [(0, 0), (64, 10), (128, 32), (220, 50), (255, 63)] {
+                let (r, mu) = k
+                    .transmittance_r_mu((x as f64 + 0.5) / tw as f64, (y as f64 + 0.5) / th as f64);
+                let depth = k.optical_depth_to_top(r, mu, TRANSMITTANCE_STEPS);
+                let gpu = transmittance[y * tw + x];
+                for c in 0..3 {
+                    let cpu = (-depth[c]).exp() as f32;
+                    assert!(
+                        (gpu[c] - cpu).abs() < 3.0e-3 + 0.01 * cpu,
+                        "radius {radius_m}, texel ({x}, {y}) channel {c}: gpu {} cpu {cpu}",
+                        gpu[c]
+                    );
+                }
+            }
+        }
     }
 
     /// Fills the G-buffer for the full frame tests: a sphere planet with a rolling normal

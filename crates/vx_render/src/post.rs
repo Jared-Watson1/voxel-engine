@@ -4,10 +4,12 @@
 //! The curve is Khronos PBR Neutral (Khronos 3D Commerce, 2024,
 //! https://github.com/KhronosGroup/ToneMapping): an identity with a small toe below the shoulder,
 //! so a lit albedo reaches the screen with its authored hue and saturation, and a hue preserving
-//! shoulder that desaturates only highlights towards white. Against the reference images (Lay of
-//! the Land) it keeps the saturated greens and the blue sky that the Narkowicz ACES fit shifts and
-//! darkens and that AgX washes out; `tests::pbr_neutral_keeps_reference_colours` records the
-//! comparison.
+//! shoulder that desaturates only highlights towards white. On colours sampled from the
+//! reference images (Lay of the Land), at their own brightness and twice it, PBR Neutral keeps at
+//! least 0.97 of the saturation with at most 3.1 degrees of hue shift; the Narkowicz ACES fit
+//! desaturates the sky and haze (down to 0.32 of the saturation) and shifts the sky's hue by up to
+//! 8.6 degrees; AgX keeps hue but not saturation (down to 0.43).
+//! `tests::pbr_neutral_keeps_reference_colours` records the comparison.
 
 use std::borrow::Cow;
 
