@@ -180,7 +180,7 @@ impl World {
             lod,
             nodes: HashMap::new(),
             edits: Arc::new(Vec::new()),
-            origin: (camera / config.voxel_size_m).round() * config.voxel_size_m,
+            origin: snap_to_voxel_grid(camera, config.voxel_size_m),
             next_generation: 1,
             tx,
             rx,
@@ -226,8 +226,7 @@ impl World {
     /// compute the same f32 position on the GPU whatever their levels (rule 6), as long as the
     /// voxel size is a power of two (0.25 to 4 m, the design range's powers of two).
     fn snap_to_voxel_grid(&self, p: DVec3) -> DVec3 {
-        let v = self.config.voxel_size_m;
-        (p / v).round() * v
+        snap_to_voxel_grid(p, self.config.voxel_size_m)
     }
 
     /// Height of `position` above the terrain under it (full detail height, no edits).
@@ -315,7 +314,7 @@ impl World {
         let origin = key.origin_m(self.config.voxel_size_m);
         let phase = origin.map(|v| v.rem_euclid(MATERIAL_TILE_M));
         ChunkPlacement {
-            offset_m: (origin - self.origin).as_vec3(),
+            offset_m: chunk_offset_m(key, self.origin, self.config.voxel_size_m),
             texture_phase_m: Vec3::new(phase.x as f32, phase.y as f32, phase.z as f32),
             voxel_size_m: key.voxel_size_m(self.config.voxel_size_m) as f32,
             transition_mask: node.mask,
@@ -816,5 +815,108 @@ fn chunk_face_sample(chunk: &Chunk, face: Face, plane: isize, u: isize, v: isize
         0 => chunk.get(plane, u, v),
         1 => chunk.get(u, plane, v),
         _ => chunk.get(u, v, plane),
+    }
+}
+
+/// `p` rounded to the level 0 voxel grid (see `World::set_origin`).
+fn snap_to_voxel_grid(p: DVec3, voxel_size_m: f64) -> DVec3 {
+    (p / voxel_size_m).round() * voxel_size_m
+}
+
+/// A chunk's origin relative to the render origin as the f32 the chunk table holds (D23),
+/// subtracted in f64.
+fn chunk_offset_m(key: ChunkKey, render_origin: DVec3, base_voxel_size_m: f64) -> Vec3 {
+    (key.origin_m(base_voxel_size_m) - render_origin).as_vec3()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GPU's arithmetic for one vertex: local position times the chunk's voxel size, plus the
+    /// chunk offset, minus the camera offset, all f32 (terrain.wgsl).
+    fn gpu_position(local_voxels: Vec3, voxel_size_m: f32, offset: Vec3, camera: Vec3) -> Vec3 {
+        (local_voxels * voxel_size_m + offset) - camera
+    }
+
+    #[test]
+    fn vertices_near_the_camera_stay_within_a_millimetre_far_from_the_planet_centre() {
+        // Chunk keys are i32 sample indices, so level 0 positions reach 2^31 voxels (2,147 km at
+        // 1 m); 1,000 km covers the 600 km worlds of M7 with their atmospheres.
+        for base in [0.25, 1.0, 4.0] {
+            for camera in [
+                DVec3::new(1.0e5, 0.37, -2.5),
+                DVec3::new(-3.0e5, 2.0e5, 1.234_567_8e5),
+            ] {
+                let camera = camera * (base / 0.25_f64).min(4.0);
+                let origin = snap_to_voxel_grid(camera + DVec3::splat(1234.5), base);
+                let camera_offset = (camera - origin).as_vec3();
+                let config = WorldConfig {
+                    voxel_size_m: base,
+                    ..WorldConfig::default()
+                };
+                for level in [0u8, 3, 7] {
+                    let key = ChunkKey::containing_at(WorldPos::body_fixed(camera), level, &config)
+                        .offset(1, -1, 0);
+                    let voxel = key.voxel_size_m(base);
+                    let offset = chunk_offset_m(key, origin, base);
+                    for local in [Vec3::ZERO, Vec3::new(17.5, 3.25, 31.999), Vec3::splat(32.0)] {
+                        let exact = key.origin_m(base) + local.as_dvec3() * voxel - camera;
+                        let gpu = gpu_position(local, voxel as f32, offset, camera_offset);
+                        let error = (gpu.as_dvec3() - exact).length();
+                        assert!(
+                            error < 1.0e-3,
+                            "error {error} m at level {level}, voxel {base} m, camera {camera}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_planet_seen_from_ten_to_the_nine_metres_has_no_visible_jitter() {
+        // D4's jitter test: the camera 10^9 m from the planet centre, rebased to itself, looking
+        // at surface chunks; the error must stay far below one pixel (about 1e-3 rad at 1080p).
+        let base = 1.0;
+        let camera = DVec3::new(1.0e9, -3.0e8, 7.0e8);
+        let origin = snap_to_voxel_grid(camera, base);
+        let camera_offset = (camera - origin).as_vec3();
+        for key in [
+            ChunkKey::at_level(7, 2, 0, 0),
+            ChunkKey::at_level(0, 312, 0, 0),
+            ChunkKey::at_level(3, -40, 1, 3),
+        ] {
+            let voxel = key.voxel_size_m(base);
+            let offset = chunk_offset_m(key, origin, base);
+            let local = Vec3::new(9.5, 31.0, 0.25);
+            let exact = key.origin_m(base) + local.as_dvec3() * voxel - camera;
+            let gpu = gpu_position(local, voxel as f32, offset, camera_offset);
+            let angle = (gpu.as_dvec3() - exact).length() / exact.length();
+            assert!(angle < 1.0e-6, "angular error {angle} rad for {key:?}");
+        }
+    }
+
+    #[test]
+    fn a_shared_vertex_is_bit_identical_from_two_levels() {
+        // A level 0 chunk's face vertex and the level 1 chunk's transition vertex on the same face
+        // reach the GPU through different offsets; with the origin on the voxel grid both sums
+        // are exact, so the f32 results are equal (D22, D23, rule 6).
+        let base = 1.0;
+        let origin = snap_to_voxel_grid(DVec3::new(10_003.7, 2_511.2, -803.9), base);
+        let camera = Vec3::new(0.3, -0.7, 0.2);
+        let fine = ChunkKey::at_level(0, 313, 78, -26);
+        let coarse = fine.parent();
+        let fine_local = Vec3::new(0.0, 12.0 + 341.0 / 1024.0, 7.5);
+        let world = fine.origin_m(base) + fine_local.as_dvec3();
+        let coarse_local = ((world - coarse.origin_m(base)) / 2.0).as_vec3();
+        let a = gpu_position(fine_local, 1.0, chunk_offset_m(fine, origin, base), camera);
+        let b = gpu_position(
+            coarse_local,
+            2.0,
+            chunk_offset_m(coarse, origin, base),
+            camera,
+        );
+        assert_eq!(a, b);
     }
 }
