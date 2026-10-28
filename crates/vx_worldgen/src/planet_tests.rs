@@ -262,7 +262,7 @@ fn golden_checksum_at_the_defaults() {
     );
 }
 
-const GOLDEN_CHECKSUM: u64 = 0x6143_1a27_dfc9_053c;
+const GOLDEN_CHECKSUM: u64 = 0x27af_5a6f_9270_cd70;
 
 #[test]
 fn classify_is_exact_and_every_surface_lies_in_the_shell() {

@@ -113,178 +113,182 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
                 }
             });
 
-            if let Some(w) = &d.world {
-                ui.separator();
-                ui.strong(format!("pipeline, {} workers", d.workers));
-                egui::Grid::new("pipeline")
-                    .num_columns(6)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for h in ["stage", "queued", "running", "done", "last", "mean / max"] {
-                            ui.weak(h);
-                        }
-                        ui.end_row();
-                        for s in &w.stages {
-                            ui.label(s.name);
-                            ui.monospace(s.queued.to_string());
-                            ui.monospace(s.running.to_string());
-                            ui.monospace(format!("{} ({} cancelled)", s.completed, s.cancelled));
-                            ui.monospace(format!("{:.2} ms", s.last_ms));
-                            ui.monospace(format!("{:.2} / {:.2} ms", s.mean_ms, s.max_ms));
-                            ui.end_row();
-                        }
-                        ui.label("upload");
-                        ui.monospace(w.upload_queued.to_string());
-                        ui.monospace("main");
-                        ui.monospace(format!(
-                            "{} ({} failed)",
-                            w.uploaded_total, w.upload_failures
-                        ));
-                        ui.monospace(format!("{:.2} ms", w.upload_ms_frame));
-                        ui.monospace(format!(
-                            "{:.2} MB/frame, peak {:.2}",
-                            w.upload_bytes_frame as f64 / 1.0e6,
-                            w.upload_bytes_peak as f64 / 1.0e6
-                        ));
-                        ui.end_row();
-                    });
-                egui::Grid::new("streaming").num_columns(2).show(ui, |ui| {
-                    row(
-                        ui,
-                        "chunks",
-                        format!(
-                            "{} resident, {} meshed, {} pending, {} empty by bounds",
-                            w.nodes, w.meshed, w.pending, w.classified_empty_total
-                        ),
-                    );
-                    let drawn: Vec<String> = w
-                        .lod
-                        .drawn_per_level
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, n)| **n > 0)
-                        .map(|(l, n)| format!("L{l} {n}"))
-                        .collect();
-                    row(ui, "drawn", drawn.join(", "));
-                    row(
-                        ui,
-                        "octree",
-                        format!(
-                            "{} nodes, {} pending, {} splits, {} merges, {:.2} ms, max {:.2} ms",
-                            w.lod.nodes,
-                            w.lod.pending,
-                            w.lod.splits_total,
-                            w.lod.merges_total,
-                            w.lod.update_ms,
-                            w.lod_ms_max
-                        ),
-                    );
-                    row(
-                        ui,
-                        "voxel memory",
-                        format!(
-                            "{:.1} MB, peak {:.1} MB",
-                            w.voxel_bytes as f64 / 1.0e6,
-                            w.voxel_bytes_peak as f64 / 1.0e6
-                        ),
-                    );
-                    row(
-                        ui,
-                        "world update",
-                        format!("{:.2} ms, max {:.2} ms", w.update_ms, w.update_ms_max),
-                    );
-                    row(
-                        ui,
-                        "render origin",
-                        format!("{} rebases, max {:.2} ms", w.rebases, w.rebase_ms_max),
-                    );
-                    row(
-                        ui,
-                        "edits",
-                        format!("{} strokes, {} log entries", w.edits, w.edit_log_entries),
-                    );
-                });
-            }
-
-            if let Some(p) = &d.pool {
-                ui.separator();
-                egui::Grid::new("gpu").num_columns(2).show(ui, |ui| {
-                    row(
-                        ui,
-                        "vertex pool",
-                        format!(
-                            "{:.1} / {:.0} MB, largest free {:.1} MB",
-                            p.vertex_bytes_used as f64 / 1.0e6,
-                            p.vertex_bytes_capacity as f64 / 1.0e6,
-                            p.largest_free_vertex_bytes as f64 / 1.0e6
-                        ),
-                    );
-                    row(
-                        ui,
-                        "index pool",
-                        format!(
-                            "{:.1} / {:.0} MB, largest free {:.1} MB",
-                            p.index_bytes_used as f64 / 1.0e6,
-                            p.index_bytes_capacity as f64 / 1.0e6,
-                            p.largest_free_index_bytes as f64 / 1.0e6
-                        ),
-                    );
-                    row(
-                        ui,
-                        "gpu meshes",
-                        format!(
-                            "{}, textures {:.1} MB",
-                            p.meshes,
-                            p.texture_bytes as f64 / 1.0e6
-                        ),
-                    );
-                    match d.cull {
-                        Some(c) => row(
-                            ui,
-                            "culling",
-                            format!(
-                                "{} chunks, {} triangles ({} frames old)",
-                                c.visible_chunks, c.triangles, c.frames_old
-                            ),
-                        ),
-                        None => row(ui, "culling", "pending".into()),
+            ui.separator();
+            egui::CollapsingHeader::new("pipeline, memory, gpu and budgets")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if let Some(w) = &d.world {
+                        ui.separator();
+                        ui.strong(format!("pipeline, {} workers", d.workers));
+                        egui::Grid::new("pipeline")
+                            .num_columns(6)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for h in ["stage", "queued", "running", "done", "last", "mean / max"] {
+                                    ui.weak(h);
+                                }
+                                ui.end_row();
+                                for s in &w.stages {
+                                    ui.label(s.name);
+                                    ui.monospace(s.queued.to_string());
+                                    ui.monospace(s.running.to_string());
+                                    ui.monospace(format!("{} ({} cancelled)", s.completed, s.cancelled));
+                                    ui.monospace(format!("{:.2} ms", s.last_ms));
+                                    ui.monospace(format!("{:.2} / {:.2} ms", s.mean_ms, s.max_ms));
+                                    ui.end_row();
+                                }
+                                ui.label("upload");
+                                ui.monospace(w.upload_queued.to_string());
+                                ui.monospace("main");
+                                ui.monospace(format!(
+                                    "{} ({} failed)",
+                                    w.uploaded_total, w.upload_failures
+                                ));
+                                ui.monospace(format!("{:.2} ms", w.upload_ms_frame));
+                                ui.monospace(format!(
+                                    "{:.2} MB/frame, peak {:.2}",
+                                    w.upload_bytes_frame as f64 / 1.0e6,
+                                    w.upload_bytes_peak as f64 / 1.0e6
+                                ));
+                                ui.end_row();
+                            });
+                        egui::Grid::new("streaming").num_columns(2).show(ui, |ui| {
+                            row(
+                                ui,
+                                "chunks",
+                                format!(
+                                    "{} resident, {} meshed, {} pending, {} empty by bounds",
+                                    w.nodes, w.meshed, w.pending, w.classified_empty_total
+                                ),
+                            );
+                            let drawn: Vec<String> = w
+                                .lod
+                                .drawn_per_level
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, n)| **n > 0)
+                                .map(|(l, n)| format!("L{l} {n}"))
+                                .collect();
+                            row(ui, "drawn", drawn.join(", "));
+                            row(
+                                ui,
+                                "octree",
+                                format!(
+                                    "{} nodes, {} pending, {} splits, {} merges, {:.2} ms, max {:.2} ms",
+                                    w.lod.nodes,
+                                    w.lod.pending,
+                                    w.lod.splits_total,
+                                    w.lod.merges_total,
+                                    w.lod.update_ms,
+                                    w.lod_ms_max
+                                ),
+                            );
+                            row(
+                                ui,
+                                "voxel memory",
+                                format!(
+                                    "{:.1} MB, peak {:.1} MB",
+                                    w.voxel_bytes as f64 / 1.0e6,
+                                    w.voxel_bytes_peak as f64 / 1.0e6
+                                ),
+                            );
+                            row(
+                                ui,
+                                "world update",
+                                format!("{:.2} ms, max {:.2} ms", w.update_ms, w.update_ms_max),
+                            );
+                            row(
+                                ui,
+                                "render origin",
+                                format!("{} rebases, max {:.2} ms", w.rebases, w.rebase_ms_max),
+                            );
+                            row(
+                                ui,
+                                "edits",
+                                format!("{} strokes, {} log entries", w.edits, w.edit_log_entries),
+                            );
+                        });
                     }
-                    if let Some(t) = &d.gpu_timings {
-                        let passes: Vec<String> = t
-                            .passes
-                            .iter()
-                            .map(|(name, ms)| format!("{name} {ms:.2}"))
-                            .collect();
-                        row(
-                            ui,
-                            "gpu time",
-                            format!("{:.2} ms: {}", t.total_ms(), passes.join(", ")),
-                        );
+
+                    if let Some(p) = &d.pool {
+                        ui.separator();
+                        egui::Grid::new("gpu").num_columns(2).show(ui, |ui| {
+                            row(
+                                ui,
+                                "vertex pool",
+                                format!(
+                                    "{:.1} / {:.0} MB, largest free {:.1} MB",
+                                    p.vertex_bytes_used as f64 / 1.0e6,
+                                    p.vertex_bytes_capacity as f64 / 1.0e6,
+                                    p.largest_free_vertex_bytes as f64 / 1.0e6
+                                ),
+                            );
+                            row(
+                                ui,
+                                "index pool",
+                                format!(
+                                    "{:.1} / {:.0} MB, largest free {:.1} MB",
+                                    p.index_bytes_used as f64 / 1.0e6,
+                                    p.index_bytes_capacity as f64 / 1.0e6,
+                                    p.largest_free_index_bytes as f64 / 1.0e6
+                                ),
+                            );
+                            row(
+                                ui,
+                                "gpu meshes",
+                                format!(
+                                    "{}, textures {:.1} MB",
+                                    p.meshes,
+                                    p.texture_bytes as f64 / 1.0e6
+                                ),
+                            );
+                            match d.cull {
+                                Some(c) => row(
+                                    ui,
+                                    "culling",
+                                    format!(
+                                        "{} chunks, {} triangles ({} frames old)",
+                                        c.visible_chunks, c.triangles, c.frames_old
+                                    ),
+                                ),
+                                None => row(ui, "culling", "pending".into()),
+                            }
+                            if let Some(t) = &d.gpu_timings {
+                                let passes: Vec<String> = t
+                                    .passes
+                                    .iter()
+                                    .map(|(name, ms)| format!("{name} {ms:.2}"))
+                                    .collect();
+                                row(
+                                    ui,
+                                    "gpu time",
+                                    format!("{:.2} ms: {}", t.total_ms(), passes.join(", ")),
+                                );
+                            }
+                        });
+                    }
+
+                    if !d.budgets.is_empty() {
+                        ui.separator();
+                        ui.strong("budgets");
+                        egui::Grid::new("budgets").num_columns(3).show(ui, |ui| {
+                            for b in &d.budgets {
+                                ui.label(b.name);
+                                let text = format!("{:.2} / {:.1} {}", b.used, b.budget, b.unit);
+                                let colour = if b.exceeded() {
+                                    egui::Color32::LIGHT_RED
+                                } else if b.fraction() > 0.8 {
+                                    egui::Color32::YELLOW
+                                } else {
+                                    egui::Color32::LIGHT_GREEN
+                                };
+                                ui.colored_label(colour, text);
+                                ui.monospace(format!("{:.0} %", b.fraction() * 100.0));
+                                ui.end_row();
+                            }
+                        });
                     }
                 });
-            }
-
-            if !d.budgets.is_empty() {
-                ui.separator();
-                ui.strong("budgets");
-                egui::Grid::new("budgets").num_columns(3).show(ui, |ui| {
-                    for b in &d.budgets {
-                        ui.label(b.name);
-                        let text = format!("{:.2} / {:.1} {}", b.used, b.budget, b.unit);
-                        let colour = if b.exceeded() {
-                            egui::Color32::LIGHT_RED
-                        } else if b.fraction() > 0.8 {
-                            egui::Color32::YELLOW
-                        } else {
-                            egui::Color32::LIGHT_GREEN
-                        };
-                        ui.colored_label(colour, text);
-                        ui.monospace(format!("{:.0} %", b.fraction() * 100.0));
-                        ui.end_row();
-                    }
-                });
-            }
-
             for error in [&d.shader_error, &d.world_error].into_iter().flatten() {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }

@@ -33,7 +33,8 @@ struct Atmosphere {
 struct View {
     // Clip space to camera relative metres (the rotation only view projection, inverted).
     inv_view_proj: mat4x4<f32>,
-    // xyz: camera position relative to the planet centre. w: unused.
+    // xyz: camera position relative to the planet centre. w: radius the terrain never dips below,
+    // 0 for the mean radius.
     camera: vec4<f32>,
     // xyz: unit direction towards the sun. w: angular radius of the disc.
     sun_direction: vec4<f32>,

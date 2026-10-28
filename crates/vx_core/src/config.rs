@@ -86,8 +86,9 @@ pub struct PlanetParams {
 /// Atmosphere of one planet for the Hillaire sky (D8, D25), given as zenith optical depths and
 /// scale heights relative to the atmosphere's height, so a small planet keeps an Earth like sky.
 /// Defaults are Earth's values from Hillaire 2020 (Rayleigh 5.802, 13.558, 33.1 per Mm over 8 km;
-/// Mie scattering 3.996 and absorption 4.40 per Mm over 1.2 km; ozone 0.650, 1.881, 0.085 per Mm
-/// in a 30 km tent centred at 25 km; a 100 km atmosphere), converted to optical depths.
+/// ozone 0.650, 1.881, 0.085 per Mm in a 30 km tent centred at 25 km; a 100 km atmosphere),
+/// converted to optical depths, except the Mie layer, which is hazier than Earth's for the art
+/// direction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AtmosphereParams {
@@ -100,9 +101,11 @@ pub struct AtmosphereParams {
     /// Rayleigh density scale height as a fraction of the atmosphere height. Design default 0.08.
     /// Range [`AtmosphereParams::SCALE_HEIGHT_FRACTION_RANGE`].
     pub rayleigh_scale_height_fraction: f64,
-    /// Mie scattering optical depth at the zenith (grey). Design default 0.0048.
+    /// Mie scattering optical depth at the zenith (grey). Design default 0.02, about four times
+    /// Earth's 0.0048, for the bright warm haze of the art direction (Lay of the Land).
     pub mie_scattering_optical_depth: f64,
-    /// Mie absorption optical depth at the zenith (grey). Design default 0.00528.
+    /// Mie absorption optical depth at the zenith (grey). Design default 0.002 (Earth 0.00528),
+    /// so the haze stays bright rather than grey.
     pub mie_absorption_optical_depth: f64,
     /// Mie density scale height as a fraction of the atmosphere height. Design default 0.012.
     pub mie_scale_height_fraction: f64,
@@ -194,8 +197,8 @@ impl Default for AtmosphereParams {
             height_fraction: 0.1,
             rayleigh_optical_depth: [0.0464, 0.1085, 0.2648],
             rayleigh_scale_height_fraction: 0.08,
-            mie_scattering_optical_depth: 0.0048,
-            mie_absorption_optical_depth: 0.00528,
+            mie_scattering_optical_depth: 0.02,
+            mie_absorption_optical_depth: 0.002,
             mie_scale_height_fraction: 0.012,
             mie_asymmetry: 0.8,
             ozone_optical_depth: [0.00975, 0.0282, 0.00128],
@@ -583,6 +586,8 @@ mod tests {
         // Earth: 6360 km radius with a 100 km atmosphere (Hillaire 2020).
         let earth = AtmosphereParams {
             height_fraction: 100.0 / 6360.0,
+            mie_scattering_optical_depth: 0.0048,
+            mie_absorption_optical_depth: 0.00528,
             ..AtmosphereParams::default()
         };
         let r = 6_360_000.0;

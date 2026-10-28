@@ -82,7 +82,8 @@ const _: () = assert!(std::mem::offset_of!(AtmosphereUniform, ground) == 64);
 pub(crate) struct ViewUniform {
     /// Clip space to camera relative metres.
     pub inv_view_proj: [[f32; 4]; 4],
-    /// xyz: camera relative to the planet centre in metres. w: unused.
+    /// xyz: camera relative to the planet centre in metres. w: radius the terrain never dips
+    /// below (the ground fallback sphere), 0 to use the mean radius.
     pub camera: [f32; 4],
     /// xyz: unit direction towards the sun. w: angular radius.
     pub sun_direction: [f32; 4],
@@ -114,7 +115,9 @@ impl ViewUniform {
         let [nr, ng, nb] = NIGHT_SKY_RADIANCE;
         Self {
             inv_view_proj: frame.view_proj.inverse().to_cols_array_2d(),
-            camera: (-frame.planet.centre_m).extend(0.0).to_array(),
+            camera: (-frame.planet.centre_m)
+                .extend(frame.planet.occluder_radius_m)
+                .to_array(),
             sun_direction: frame
                 .sun
                 .direction

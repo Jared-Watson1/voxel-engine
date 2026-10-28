@@ -45,6 +45,10 @@ pub struct Args {
     pub screenshot: Option<PathBuf>,
 }
 
+/// Exposure at startup in stops: half a stop over the physical sun keeps the bright skies and
+/// greens of the art direction.
+pub const DEFAULT_EXPOSURE_EV: f32 = 0.5;
+
 pub const USAGE: &str = "\
 vx_game: Voxel Engine M2
 
@@ -68,7 +72,7 @@ OPTIONS:
     --descent-climb <s>     seconds for the climb and for the way down (default 30)
     --time-of-day <f>       local solar time at the start, fraction of a day (0.25 sunrise)
     --warp <x>              simulation seconds per real second at startup (default 1)
-    --exposure <ev>         exposure in stops (default 0)
+    --exposure <ev>         exposure in stops (default 0.5)
     --edit-test             apply scripted brushes during the measurement
     --brush-radius <voxels> brush radius at startup (default 3)
     --no-overlay            hide the debug overlay
@@ -113,7 +117,7 @@ impl Args {
             descent_climb_s: 30.0,
             time_of_day: None,
             warp: None,
-            exposure_ev: 0.0,
+            exposure_ev: DEFAULT_EXPOSURE_EV,
             edit_test: false,
             brush_radius_voxels: None,
             no_overlay: false,

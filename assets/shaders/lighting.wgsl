@@ -144,14 +144,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         lut_weight = smoothstep(MARCH_BELOW_RAD, LUTS_ABOVE_RAD, atmosphere_radius_rad);
     }
 
-    // A surface is terrain, or the ground sphere where a ray meets it with no terrain drawn (far
-    // from orbit, or a streaming hole), lit with the ground albedo.
+    // A surface is terrain, or the ground sphere where a ray meets it with no terrain drawn (a
+    // streaming hole), lit with the ground albedo. The sphere sits at the radius the terrain never
+    // dips below, so it never shows through valleys under the mean radius.
     var surface = false;
     var distance = 0.0;
     var dir = ray;
     var colour = vec3<f32>(0.0);
     if depth == 0.0 {
-        let t_ground = ray_sphere_nearest(camera, ray, bottom_radius());
+        let fallback_radius = select(bottom_radius(), frame.camera.w, frame.camera.w > 0.0);
+        let t_ground = ray_sphere_nearest(camera, ray, fallback_radius);
         if t_ground >= 0.0 {
             surface = true;
             distance = t_ground;

@@ -112,6 +112,14 @@ struct Level {
     detail_amplitude_m: f64,
 }
 
+impl Level {
+    /// Depth below the interpolated surface at which the material layers start: one voxel of the
+    /// level plus the level's detail amplitude (see `PlanetSampler::material`).
+    fn material_shift_m(&self) -> f64 {
+        self.voxel_size_m + self.detail_amplitude_m
+    }
+}
+
 /// A sample's place on the cube sphere grid.
 #[derive(Debug, Clone, Copy)]
 struct Located {
@@ -430,7 +438,7 @@ impl PlanetSampler {
         } else {
             e.base_m
         };
-        (distance_m, self.material(&e))
+        (distance_m, self.material(&lv, &e))
     }
 
     /// Fills every sample of `chunk`, apron included, at the chunk's level. Bit identical to
@@ -501,7 +509,9 @@ impl PlanetSampler {
         let margin = (lv.coarse_skip_m + lv.detail_amplitude_m) / slope_factor_min;
         Thresholds {
             air_m: self.radius_m + h_hi + margin + self.slack_m,
-            rock_m: self.radius_m + h_lo - margin.max(self.rock_depth_m + lv.unit_m) - self.slack_m,
+            rock_m: self.radius_m + h_lo
+                - margin.max(self.rock_depth_m + lv.material_shift_m() + lv.unit_m)
+                - self.slack_m,
             slope_factor_min,
         }
     }
@@ -598,11 +608,15 @@ impl PlanetSampler {
     }
 
     /// Material of the solid at an evaluated sample: by depth below the interpolated surface,
-    /// then by the surface's height and slope.
+    /// then by the surface's height and slope. Depth counts from [`Level::material_shift_m`]
+    /// below the interpolated surface: the mesher takes a vertex's material from the solid sample
+    /// of its edge, up to one voxel deep, and the detail noise moves the true surface up to its
+    /// amplitude below the interpolated one. Without the shift a coarse level (128 m voxels at
+    /// level 7) and every hollow of the detail noise would show soil where grass belongs.
     #[inline(always)]
-    fn material(&self, e: &Evaluated) -> Material {
+    fn material(&self, lv: &Level, e: &Evaluated) -> Material {
         let t = &self.params.terrain;
-        let depth_m = e.h_m - e.altitude_m;
+        let depth_m = e.h_m - e.altitude_m - lv.material_shift_m();
         if depth_m < t.grass_depth_m {
             if e.h_m < t.sand_below_m {
                 Material::SAND
@@ -927,7 +941,7 @@ impl PlanetSampler {
             return Voxel::AIR;
         }
         if above_m * slope_factor_min + lv.detail_amplitude_m < -lv.skip_m
-            && -above_m >= self.rock_depth_m
+            && -above_m - lv.material_shift_m() >= self.rock_depth_m
         {
             return Voxel::solid(Material::ROCK);
         }
@@ -937,7 +951,7 @@ impl PlanetSampler {
                 return Voxel::AIR;
             }
             if e.base_m + lv.detail_amplitude_m < -lv.skip_m {
-                return Voxel::solid(self.material(&e));
+                return Voxel::solid(self.material(lv, &e));
             }
             e.base_m + self.noise.detail(p)
         } else {
@@ -945,7 +959,7 @@ impl PlanetSampler {
         };
         let distance = Voxel::quantise_distance(distance_m * lv.inv_voxel);
         let material = if distance < 0 {
-            self.material(&e)
+            self.material(lv, &e)
         } else {
             Material::AIR
         };
