@@ -1,4 +1,5 @@
-//! Voxel Engine: the binary. Window, input, the app loop, camera and debug overlay.
+//! Voxel Engine: the binary. Window, input, the app loop, the planet world, the sky clock,
+//! camera and debug overlay.
 
 mod app;
 mod args;
@@ -7,6 +8,7 @@ mod capture;
 mod flight;
 mod overlay;
 mod profiler;
+mod sky;
 mod stats;
 mod world;
 

@@ -1,6 +1,6 @@
 use glam::DVec3;
 use vx_core::BudgetUse;
-use vx_render::{CullStats, PoolStats};
+use vx_render::{CullStats, GpuTimings, PoolStats};
 
 use crate::app::FrameSections;
 use crate::world::WorldStats;
@@ -13,9 +13,15 @@ pub struct OverlayData {
     pub sections: FrameSections,
     pub camera_m: DVec3,
     pub speed_m_s: f64,
+    pub altitude_m: f64,
     pub voxel_size_m: Option<f64>,
-    pub view_radius_chunks: Option<u32>,
+    pub lod: Option<(u32, f64)>,
+    pub planet_radius_km: Option<f64>,
     pub seed: Option<u64>,
+    /// Local solar time, warp and simulation time.
+    pub time: String,
+    pub exposure_ev: f32,
+    pub gpu_timings: Option<GpuTimings>,
     pub workers: usize,
     pub world: Option<WorldStats>,
     pub pool: Option<PoolStats>,
@@ -33,7 +39,7 @@ pub struct OverlayData {
 }
 
 pub fn draw(ctx: &egui::Context, d: &OverlayData) {
-    egui::Window::new("Voxel Engine M1")
+    egui::Window::new("Voxel Engine M2")
         .default_pos([12.0, 12.0])
         .resizable(false)
         .show(ctx, |ui| {
@@ -69,16 +75,25 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
                         d.camera_m.x, d.camera_m.y, d.camera_m.z
                     ),
                 );
-                row(ui, "speed", format!("{:.1} m/s", d.speed_m_s));
+                row(
+                    ui,
+                    "altitude",
+                    format!("{:.1} m, speed {:.1} m/s", d.altitude_m, d.speed_m_s),
+                );
                 row(
                     ui,
                     "world",
-                    match (d.voxel_size_m, d.view_radius_chunks, d.seed) {
-                        (Some(v), Some(r), Some(s)) => {
-                            format!("voxel {v} m, radius {r} chunks, seed {s}")
-                        }
+                    match (d.planet_radius_km, d.voxel_size_m, d.lod, d.seed) {
+                        (Some(r), Some(v), Some((levels, radius)), Some(s)) => format!(
+                            "planet {r} km, voxel {v} m, {levels} levels, lod radius {radius}, seed {s}"
+                        ),
                         _ => "loading".into(),
                     },
+                );
+                row(
+                    ui,
+                    "time",
+                    format!("{}, exposure {:+.1} EV", d.time, d.exposure_ev),
                 );
                 row(ui, "brush", d.brush.clone());
                 if let Some(p) = d.flight_progress {
@@ -138,8 +153,30 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
                         ui,
                         "chunks",
                         format!(
-                            "{} resident, {} meshed, {} dense, {} pending",
-                            w.resident, w.meshed, w.dense, w.pending
+                            "{} resident, {} meshed, {} pending, {} empty by bounds",
+                            w.nodes, w.meshed, w.pending, w.classified_empty_total
+                        ),
+                    );
+                    let drawn: Vec<String> = w
+                        .lod
+                        .drawn_per_level
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| **n > 0)
+                        .map(|(l, n)| format!("L{l} {n}"))
+                        .collect();
+                    row(ui, "drawn", drawn.join(", "));
+                    row(
+                        ui,
+                        "octree",
+                        format!(
+                            "{} nodes, {} pending, {} splits, {} merges, {:.2} ms, max {:.2} ms",
+                            w.lod.nodes,
+                            w.lod.pending,
+                            w.lod.splits_total,
+                            w.lod.merges_total,
+                            w.lod.update_ms,
+                            w.lod_ms_max
                         ),
                     );
                     row(
@@ -154,18 +191,12 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
                     row(
                         ui,
                         "world update",
-                        format!(
-                            "{:.2} ms, max {:.2} ms; draw list {:.2} ms",
-                            w.update_ms, w.update_ms_max, w.draw_list_ms
-                        ),
+                        format!("{:.2} ms, max {:.2} ms", w.update_ms, w.update_ms_max),
                     );
                     row(
                         ui,
-                        "recentre",
-                        format!(
-                            "{:.2} ms last, {:.2} ms max",
-                            w.stream_ms_last, w.stream_ms_max
-                        ),
+                        "render origin",
+                        format!("{} rebases, max {:.2} ms", w.rebases, w.rebase_ms_max),
                     );
                     row(
                         ui,
@@ -218,6 +249,18 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
                         ),
                         None => row(ui, "culling", "pending".into()),
                     }
+                    if let Some(t) = &d.gpu_timings {
+                        let passes: Vec<String> = t
+                            .passes
+                            .iter()
+                            .map(|(name, ms)| format!("{name} {ms:.2}"))
+                            .collect();
+                        row(
+                            ui,
+                            "gpu time",
+                            format!("{:.2} ms: {}", t.total_ms(), passes.join(", ")),
+                        );
+                    }
                 });
             }
 
@@ -245,7 +288,10 @@ pub fn draw(ctx: &egui::Context, d: &OverlayData) {
             for error in [&d.shader_error, &d.world_error].into_iter().flatten() {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
-            ui.weak("RMB look, WASD move, LMB brush, B dig/place, [ ] radius, F12 screenshot");
+            ui.weak(
+                "RMB look, WASD move, scroll speed, LMB brush, B dig/place, [ ] radius, \
+                 , . time, - = exposure, F12 screenshot",
+            );
         });
 }
 

@@ -1,17 +1,22 @@
-use glam::{DQuat, DVec3, Mat4};
+use glam::{DMat3, DQuat, DVec3, Mat4};
 use vx_core::{Projection, WorldPos};
 
-/// Slowest and fastest fly speeds; scrolling moves between them logarithmically.
-pub const MIN_SPEED_M_S: f64 = 1.0;
-pub const MAX_SPEED_M_S: f64 = 10_000.0;
+/// Slowest and fastest speed factors; scrolling moves between them logarithmically.
+pub const MIN_SPEED_SCALE: f64 = 0.01;
+pub const MAX_SPEED_SCALE: f64 = 100.0;
 /// Speed factor per scroll line.
 const SCROLL_SPEED_FACTOR: f64 = 1.25;
 /// Mouse look sensitivity in radians per pixel of mouse motion.
 const LOOK_RAD_PER_PIXEL: f64 = 0.0025;
-/// Pitch stops this far short of straight up or down so yaw stays defined.
+/// Pitch stops this far short of straight up or down so the heading stays defined.
 const PITCH_LIMIT_RAD: f64 = 0.01;
+/// Fly speed per metre of altitude at a speed scale of 1, so a dive from orbit and a stroll over
+/// the grass both take seconds: 20 m/s near the ground, 1 km/s at 1 km, 100 km/s at 100 km.
+const SPEED_PER_ALTITUDE_PER_S: f64 = 1.0;
+/// Altitudes below this fly as if at this altitude, so the camera never stalls on the ground.
+const SPEED_FLOOR_ALTITUDE_M: f64 = 20.0;
 
-/// Movement keys held this frame, in camera local axes.
+/// Movement keys held this frame, in camera local axes; up and down follow the local vertical.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MoveInput {
     pub forward: bool,
@@ -22,87 +27,119 @@ pub struct MoveInput {
     pub down: bool,
 }
 
-/// Free fly camera with an f64 position (D4).
+/// Free fly camera with an f64 position in the planet's body fixed frame (D4) whose horizon stays
+/// level: up is the radial direction from the planet centre, so the camera can fly around the
+/// whole planet and out to orbit without a pole singularity or accumulated roll.
 ///
-/// View space is right handed with the camera looking down -Z and +Y up. Orientation is the
-/// quaternion `yaw about frame +Y * pitch about camera +X`, rebuilt from the two angles so pitch
-/// can be clamped exactly and no roll accumulates.
+/// View space is right handed with the camera looking down -Z and +Y up.
 #[derive(Debug, Clone)]
 pub struct FlyCamera {
     pub position: WorldPos,
-    yaw_rad: f64,
-    pitch_rad: f64,
+    orientation: DQuat,
+    /// Multiplies the altitude based speed; scrolling changes it.
+    pub speed_scale: f64,
+    /// Speed of the last update in metres per second, for the overlay.
     pub speed_m_s: f64,
     pub projection: Projection,
 }
 
 impl FlyCamera {
-    pub fn looking_at(
-        position: WorldPos,
-        target: DVec3,
-        speed_m_s: f64,
-        projection: Projection,
-    ) -> Self {
-        let forward = (target - position.m).normalize();
+    pub fn looking_at(position: WorldPos, target: DVec3, projection: Projection) -> Self {
         let mut camera = Self {
             position,
-            yaw_rad: (-forward.x).atan2(-forward.z),
-            pitch_rad: forward.y.clamp(-1.0, 1.0).asin(),
-            speed_m_s: speed_m_s.clamp(MIN_SPEED_M_S, MAX_SPEED_M_S),
+            orientation: DQuat::IDENTITY,
+            speed_scale: 1.0,
+            speed_m_s: 0.0,
             projection,
         };
-        camera.clamp_pitch();
+        camera.face(target - position.m);
         camera
     }
 
-    pub fn orientation(&self) -> DQuat {
-        DQuat::from_rotation_y(self.yaw_rad) * DQuat::from_rotation_x(self.pitch_rad)
+    /// Radial up at the camera; +Y at the planet centre itself.
+    pub fn up(&self) -> DVec3 {
+        self.position.m.normalize_or(DVec3::Y)
     }
 
-    #[cfg(test)]
+    pub fn orientation(&self) -> DQuat {
+        self.orientation
+    }
+
     pub fn forward(&self) -> DVec3 {
-        self.orientation() * DVec3::NEG_Z
+        self.orientation * DVec3::NEG_Z
+    }
+
+    /// Turns the camera to look along `direction`, level with the local horizon.
+    pub fn face(&mut self, direction: DVec3) {
+        let up = self.up();
+        let forward = direction.normalize_or(-up);
+        self.orientation = level_orientation(forward, up, self.forward());
     }
 
     pub fn look(&mut self, dx_px: f64, dy_px: f64) {
-        self.yaw_rad = (self.yaw_rad - dx_px * LOOK_RAD_PER_PIXEL) % std::f64::consts::TAU;
-        self.pitch_rad -= dy_px * LOOK_RAD_PER_PIXEL;
-        self.clamp_pitch();
+        let up = self.up();
+        let yaw = DQuat::from_axis_angle(up, -dx_px * LOOK_RAD_PER_PIXEL);
+        let right = self.orientation * DVec3::X;
+        let pitch = DQuat::from_axis_angle(right, -dy_px * LOOK_RAD_PER_PIXEL);
+        let forward = yaw * pitch * self.forward();
+        self.orientation = level_orientation(forward, up, self.forward());
     }
 
-    fn clamp_pitch(&mut self) {
-        let limit = std::f64::consts::FRAC_PI_2 - PITCH_LIMIT_RAD;
-        self.pitch_rad = self.pitch_rad.clamp(-limit, limit);
-    }
-
-    /// Scales speed by a fixed factor per scroll line, clamped to the speed range.
+    /// Scales the speed factor per scroll line, clamped to the range.
     pub fn scroll(&mut self, lines: f64) {
-        self.speed_m_s =
-            (self.speed_m_s * SCROLL_SPEED_FACTOR.powf(lines)).clamp(MIN_SPEED_M_S, MAX_SPEED_M_S);
+        self.speed_scale = (self.speed_scale * SCROLL_SPEED_FACTOR.powf(lines))
+            .clamp(MIN_SPEED_SCALE, MAX_SPEED_SCALE);
     }
 
-    pub fn update(&mut self, input: MoveInput, dt_s: f64) {
+    /// Moves by the held keys for `dt_s` at a speed proportional to `altitude_m`, then keeps the
+    /// horizon level against the new radial up.
+    pub fn update(&mut self, input: MoveInput, dt_s: f64, altitude_m: f64) {
         let axis = |pos: bool, neg: bool| f64::from(u8::from(pos)) - f64::from(u8::from(neg));
         let local = DVec3::new(
             axis(input.right, input.left),
             0.0,
             axis(input.back, input.forward),
         );
-        let vertical = DVec3::Y * axis(input.up, input.down);
-        let direction = self.orientation() * local + vertical;
+        let up = self.up();
+        let direction = self.orientation * local + up * axis(input.up, input.down);
+        self.speed_m_s =
+            self.speed_scale * SPEED_PER_ALTITUDE_PER_S * altitude_m.max(SPEED_FLOOR_ALTITUDE_M);
         if direction != DVec3::ZERO {
             self.position.m += direction.normalize() * self.speed_m_s * dt_s;
         }
+        // Carry the view with the turn of the local vertical, so flying around the planet keeps
+        // the pitch relative to the horizon instead of a fixed direction in space.
+        let transport = DQuat::from_rotation_arc(up, self.up());
+        let forward = transport * self.forward();
+        self.orientation = level_orientation(forward, self.up(), forward);
     }
 
     /// Rotation only view matrix: the camera sits at the origin of the render frame (D4).
     pub fn view_rotation(&self) -> Mat4 {
-        Mat4::from_quat(self.orientation().inverse().as_quat())
+        Mat4::from_quat(self.orientation.inverse().as_quat())
     }
 
     pub fn view_proj(&self) -> Mat4 {
         self.projection.matrix() * self.view_rotation()
     }
+}
+
+/// The orientation looking along `forward` with no roll against `up`, the pitch limited short of
+/// straight up or down. When `forward` is too close to vertical, the heading of `previous` is
+/// kept so the limit does not spin the camera.
+fn level_orientation(forward: DVec3, up: DVec3, previous: DVec3) -> DQuat {
+    let max_sin = (std::f64::consts::FRAC_PI_2 - PITCH_LIMIT_RAD).sin();
+    let mut horizontal = forward - up * forward.dot(up);
+    if horizontal.length_squared() < 1.0e-12 {
+        horizontal = previous - up * previous.dot(up);
+    }
+    let horizontal = horizontal.normalize_or(up.any_orthonormal_vector());
+    let sin_pitch = forward.dot(up).clamp(-max_sin, max_sin);
+    let cos_pitch = (1.0 - sin_pitch * sin_pitch).sqrt();
+    let f = horizontal * cos_pitch + up * sin_pitch;
+    let right = f.cross(up).normalize();
+    let cam_up = right.cross(f);
+    DQuat::from_mat3(&DMat3::from_cols(right, cam_up, -f))
 }
 
 #[cfg(test)]
@@ -123,7 +160,7 @@ mod tests {
     fn looking_at_centres_the_target() {
         let eye = WorldPos::body_fixed(DVec3::new(1.0e9, 20.0, 35.0));
         let target = DVec3::new(1.0e9 + 3.0, 0.0, 0.0);
-        let camera = FlyCamera::looking_at(eye, target, 10.0, projection());
+        let camera = FlyCamera::looking_at(eye, target, projection());
         let rel = camera_relative(WorldPos::body_fixed(target), eye);
         let clip = camera.view_proj() * rel.extend(1.0);
         let ndc = clip.truncate() / clip.w;
@@ -132,58 +169,81 @@ mod tests {
     }
 
     #[test]
-    fn forward_moves_along_the_view_direction() {
-        let mut camera = FlyCamera::looking_at(
-            WorldPos::default(),
-            DVec3::new(0.0, 0.0, -1.0),
-            4.0,
-            projection(),
-        );
-        camera.update(
-            MoveInput {
-                forward: true,
-                ..Default::default()
-            },
-            0.5,
-        );
+    fn horizon_stays_level_everywhere_on_the_planet() {
+        for p in [
+            DVec3::new(0.0, 10_000.0, 0.0),
+            DVec3::new(10_000.0, 0.0, 0.0),
+            DVec3::new(-3000.0, -7000.0, 6000.0),
+            DVec3::new(0.0, -10_000.0, 1.0e-3),
+        ] {
+            let mut camera = FlyCamera::looking_at(
+                WorldPos::body_fixed(p),
+                p + p.any_orthonormal_vector() * 100.0,
+                projection(),
+            );
+            for i in 0..200 {
+                camera.look(
+                    13.0 * f64::from(i % 7) - 30.0,
+                    5.0 * f64::from(i % 5) - 10.0,
+                );
+                let right = camera.orientation() * DVec3::X;
+                assert!(right.dot(camera.up()).abs() < 1.0e-9, "no roll at {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn flying_around_the_planet_keeps_the_view_level() {
+        let start = DVec3::new(0.0, 10_100.0, 0.0);
+        let mut camera =
+            FlyCamera::looking_at(WorldPos::body_fixed(start), start + DVec3::X, projection());
+        let input = MoveInput {
+            forward: true,
+            ..Default::default()
+        };
+        for _ in 0..2000 {
+            camera.update(input, 0.1, 100.0);
+            let up = camera.up();
+            assert!(
+                camera.forward().dot(up).abs() < 0.05,
+                "forward stays near the horizon"
+            );
+            assert!((camera.orientation() * DVec3::X).dot(up).abs() < 1.0e-9);
+        }
         assert!(
-            camera
-                .position
-                .m
-                .abs_diff_eq(DVec3::new(0.0, 0.0, -2.0), 1.0e-12)
+            camera.position.m.y < 10_000.0,
+            "the camera passed over the pole"
         );
     }
 
     #[test]
-    fn pitch_is_limited_short_of_the_poles() {
-        let mut camera = FlyCamera::looking_at(
-            WorldPos::default(),
-            DVec3::new(0.0, 0.0, -1.0),
-            4.0,
-            projection(),
-        );
+    fn pitch_is_limited_short_of_the_vertical() {
+        let p = DVec3::new(10_000.0, 0.0, 0.0);
+        let mut camera = FlyCamera::looking_at(WorldPos::body_fixed(p), p + DVec3::Z, projection());
         for _ in 0..1000 {
             camera.look(0.0, -50.0);
         }
-        let f = camera.forward();
-        assert!(f.y < 1.0 && f.y > 0.99, "{f}");
+        let f = camera.forward().dot(camera.up());
+        assert!(f < 1.0 && f > 0.99, "{f}");
         for _ in 0..1000 {
             camera.look(37.0, 50.0);
         }
-        let f = camera.forward();
-        assert!(f.y > -1.0 && f.y < -0.99, "{f}");
-        let right = camera.orientation() * DVec3::X;
-        assert!(right.y.abs() < 1.0e-9, "no roll accumulates: {right}");
+        let f = camera.forward().dot(camera.up());
+        assert!(f > -1.0 && f < -0.99, "{f}");
     }
 
     #[test]
-    fn scroll_clamps_to_the_speed_range() {
-        let mut camera =
-            FlyCamera::looking_at(WorldPos::default(), DVec3::NEG_Z, 4.0, projection());
+    fn speed_follows_altitude_and_scroll_clamps() {
+        let p = DVec3::new(0.0, 10_000.0, 0.0);
+        let mut camera = FlyCamera::looking_at(WorldPos::body_fixed(p), p + DVec3::X, projection());
+        camera.update(MoveInput::default(), 0.0, 1000.0);
+        assert_eq!(camera.speed_m_s, 1000.0);
+        camera.update(MoveInput::default(), 0.0, 0.5);
+        assert_eq!(camera.speed_m_s, SPEED_FLOOR_ALTITUDE_M);
         camera.scroll(1000.0);
-        assert_eq!(camera.speed_m_s, MAX_SPEED_M_S);
+        assert_eq!(camera.speed_scale, MAX_SPEED_SCALE);
         camera.scroll(-1000.0);
-        assert_eq!(camera.speed_m_s, MIN_SPEED_M_S);
+        assert_eq!(camera.speed_scale, MIN_SPEED_SCALE);
     }
 
     #[test]
@@ -191,7 +251,6 @@ mod tests {
         let camera = FlyCamera::looking_at(
             WorldPos::body_fixed(DVec3::splat(5.0e8)),
             DVec3::splat(5.0e8) + DVec3::X,
-            4.0,
             projection(),
         );
         assert_eq!(camera.view_rotation().w_axis.truncate(), Vec3::ZERO);

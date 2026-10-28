@@ -8,9 +8,10 @@ use vx_core::{
     BudgetMonitor, BudgetUse, Budgets, FileWatcher, JobSystem, Projection, WorldConfig, WorldPos,
 };
 use vx_render::{
-    EguiFrame, FrameInput, FrameStatus, MaterialTextures, PreparedMaterialTextures, RenderSettings,
-    Renderer,
+    EguiFrame, FrameInput, FrameStatus, MaterialTextures, PlanetView, PreparedMaterialTextures,
+    RenderSettings, Renderer, SHADER_FILES,
 };
+use vx_universe::SystemConfig;
 use vx_voxel::{Brush, BrushOp, BrushShape, Material};
 use vx_worldgen::material_textures;
 use winit::application::ApplicationHandler;
@@ -25,14 +26,14 @@ use winit::window::{Window, WindowId};
 use crate::args::Args;
 use crate::camera::{FlyCamera, MoveInput};
 use crate::capture::{self, CaptureOutcome};
-use crate::flight::Flight;
+use crate::flight::{Descent, EYE_HEIGHT_M, Flight, SurfaceLoop, tangent_axes};
 use crate::overlay::{self, OverlayData};
+use crate::sky::{Sky, clock_text};
 use crate::stats::{FrameSamples, Summary};
 use crate::world::{STAGE_GENERATE, STAGE_MESH, STAGE_NAMES, World};
 
 const FOV_Y_RAD: f32 = std::f32::consts::FRAC_PI_3;
 const NEAR_PLANE_M: f32 = 0.05;
-const SUN_DIR: Vec3 = Vec3::new(-0.6, 0.7, 0.4);
 /// Seconds of rendering after the world settles before measurements or captures start.
 const WARMUP_S: f64 = 2.0;
 /// Longest wait for the initial streaming to settle before an automated run proceeds anyway.
@@ -49,9 +50,12 @@ const BRUSH_RADIUS_MAX_VOXELS: f64 = 16.0;
 const BRUSH_REACH_CHUNKS: f64 = 8.0;
 /// Frames between scripted brushes in `--edit-test`.
 const EDIT_TEST_INTERVAL_FRAMES: u64 = 30;
-/// Initial height above the terrain in chunk extents, and the initial fly speed.
-const START_HEIGHT_CHUNKS: f64 = 1.5;
-const START_SPEED_M_S: f64 = 20.0;
+/// Start position: latitude in degrees, local solar time when none is given (a low morning sun)
+/// and the eye height above the terrain.
+const START_LATITUDE_DEG: f64 = 25.0;
+const START_TIME_OF_DAY: f64 = 0.3;
+/// Exposure change per key press in stops.
+const EXPOSURE_STEP_EV: f32 = 0.5;
 
 pub struct App {
     args: Args,
@@ -76,6 +80,7 @@ impl App {
 /// Everything loaded off the main thread at startup (D9).
 struct Startup {
     config: WorldConfig,
+    system: SystemConfig,
     textures: PreparedMaterialTextures,
     load_ms: f64,
 }
@@ -125,12 +130,15 @@ struct Running {
     input: MoveInput,
     looking: bool,
     world_path: PathBuf,
-    terrain_shader_path: PathBuf,
-    cull_shader_path: PathBuf,
+    system_path: PathBuf,
+    shader_dir: PathBuf,
     watcher: Option<FileWatcher>,
     jobs: JobSystem,
     startup_rx: Receiver<Result<Startup, String>>,
     world: Option<World>,
+    sky: Option<Sky>,
+    exposure_ev: f32,
+    start_time_of_day: Option<f64>,
     world_error: Option<String>,
     shader_error: Option<String>,
     brush: BrushSettings,
@@ -225,6 +233,18 @@ impl Running {
                             self.brush.radius_voxels =
                                 (self.brush.radius_voxels + 1.0).min(BRUSH_RADIUS_MAX_VOXELS);
                         }
+                        KeyCode::Comma if pressed && !event.repeat => {
+                            if let Some(sky) = &mut self.sky {
+                                sky.step_warp(-1);
+                            }
+                        }
+                        KeyCode::Period if pressed && !event.repeat => {
+                            if let Some(sky) = &mut self.sky {
+                                sky.step_warp(1);
+                            }
+                        }
+                        KeyCode::Minus if pressed => self.exposure_ev -= EXPOSURE_STEP_EV,
+                        KeyCode::Equal if pressed => self.exposure_ev += EXPOSURE_STEP_EV,
                         _ => self.set_key(code, pressed),
                     }
                 }
@@ -284,13 +304,12 @@ impl Running {
 
         let assets = args.assets_dir.clone();
         let world_path = assets.join("config/world.ron");
-        let terrain_shader_path = assets.join("shaders/terrain.wgsl");
-        let cull_shader_path = assets.join("shaders/terrain_cull.wgsl");
-        let watcher = match FileWatcher::new(&[
-            terrain_shader_path.clone(),
-            cull_shader_path.clone(),
-            world_path.clone(),
-        ]) {
+        let system_path = assets.join("config/system.ron");
+        let shader_dir = assets.join("shaders");
+        let mut watched: Vec<PathBuf> = SHADER_FILES.iter().map(|f| shader_dir.join(f)).collect();
+        watched.push(world_path.clone());
+        watched.push(system_path.clone());
+        let watcher = match FileWatcher::new(&watched) {
             Ok(w) => Some(w),
             Err(e) => {
                 tracing::warn!("hot reload disabled, file watcher failed: {e}");
@@ -306,14 +325,13 @@ impl Running {
         tracing::info!("job system with {workers} workers");
 
         let (startup_tx, startup_rx) = channel();
-        spawn_startup(args, &world_path, startup_tx);
+        spawn_startup(args, &world_path, &system_path, startup_tx);
         let (capture_tx, capture_rx) = channel();
 
         let (w, h) = renderer.surface_size();
         let camera = FlyCamera::looking_at(
-            WorldPos::body_fixed(DVec3::new(0.0, 50.0, 0.0)),
-            DVec3::new(0.0, 0.0, -100.0),
-            START_SPEED_M_S,
+            WorldPos::body_fixed(DVec3::new(0.0, 20_000.0, 0.0)),
+            DVec3::new(100.0, 20_000.0, 0.0),
             Projection {
                 fov_y_rad: FOV_Y_RAD,
                 aspect: w as f32 / h as f32,
@@ -331,12 +349,15 @@ impl Running {
             input: MoveInput::default(),
             looking: false,
             world_path,
-            terrain_shader_path,
-            cull_shader_path,
+            system_path,
+            shader_dir,
             watcher,
             jobs,
             startup_rx,
             world: None,
+            sky: None,
+            exposure_ev: args.exposure_ev,
+            start_time_of_day: args.time_of_day,
             world_error: None,
             shader_error: None,
             brush: BrushSettings {
@@ -395,9 +416,7 @@ impl Running {
         let config = *world.config();
         let direction = self.camera.orientation() * DVec3::NEG_Z;
         let right = self.camera.orientation() * DVec3::X;
-        // Never pick beyond the streamed sphere, so a brush always lands on generated chunks.
-        let reach = BRUSH_REACH_CHUNKS.min(f64::from(crate::world::VIEW_RADIUS_CHUNKS) - 1.0)
-            * config.chunk_extent_m();
+        let reach = BRUSH_REACH_CHUNKS * config.chunk_extent_m();
         let Some(hit) = world.raycast(self.camera.position, direction, reach) else {
             return 0;
         };
@@ -413,7 +432,7 @@ impl Running {
             },
             op,
         };
-        world.apply_brush(&brush, &mut self.renderer)
+        world.apply_brush(&brush)
     }
 
     /// Runs one frame. Returns an exit code when automation has finished.
@@ -437,6 +456,9 @@ impl Running {
             profiling::scope!("update");
             let (w, h) = self.renderer.surface_size();
             self.camera.projection.aspect = w as f32 / h as f32;
+            if let Some(sky) = &mut self.sky {
+                sky.advance(dt_s);
+            }
             self.update_camera(dt_s);
             if let Some(world) = &mut self.world {
                 world.update(self.camera.position, &mut self.renderer);
@@ -466,14 +488,23 @@ impl Running {
         sections.egui_ms = ms_since(egui_start);
 
         let draw_list_start = Instant::now();
-        // M1 bridge until the planet world: the render origin is the frame origin and the
-        // planet centre is far below, so up is +Y.
-        let camera_offset_m = self.camera.position.m.as_vec3();
-        let planet = vx_render::PlanetView {
-            centre_m: Vec3::new(0.0, -1.0e6 - camera_offset_m.y, 0.0),
-            radius_m: 1.0e6,
-            occluder_radius_m: 0.0,
+        let camera_m = self.camera.position.m;
+        let (camera_offset_m, planet) = match &self.world {
+            Some(world) => (
+                (camera_m - world.origin()).as_vec3(),
+                PlanetView {
+                    centre_m: (-camera_m).as_vec3(),
+                    radius_m: world.planet().radius_m() as f32,
+                    occluder_radius_m: world.sampler().shell_m().0 as f32,
+                },
+            ),
+            None => (Vec3::ZERO, PlanetView::default()),
         };
+        let sun = self
+            .sky
+            .as_ref()
+            .map_or_else(vx_render::SunLight::default, Sky::sun_light);
+        let moon = self.sky.as_ref().and_then(|sky| sky.moon_light(camera_m));
         sections.draw_list_ms = ms_since(draw_list_start);
         let render_start = Instant::now();
         let rendered = {
@@ -482,12 +513,9 @@ impl Running {
                 view_proj: self.camera.view_proj(),
                 camera_offset_m,
                 planet,
-                sun: vx_render::SunLight {
-                    direction: SUN_DIR.normalize(),
-                    ..Default::default()
-                },
-                moon: None,
-                exposure_ev: 0.0,
+                sun,
+                moon,
+                exposure_ev: self.exposure_ev,
                 egui: Some(EguiFrame {
                     primitives: &primitives,
                     textures_delta: full_output.textures_delta,
@@ -535,18 +563,21 @@ impl Running {
 
     fn update_camera(&mut self, dt_s: f64) {
         let measuring = matches!(self.automation, Automation::Measuring { .. });
-        if let (Some(flight), Some(world)) = (&mut self.flight, &self.world) {
+        let Some(world) = &self.world else {
+            return;
+        };
+        if let Some(flight) = &mut self.flight {
             // The flight holds its start pose until measuring begins, so streaming settles there.
-            let (position, target) =
-                flight.advance(if measuring { dt_s } else { 0.0 }, world.sampler());
-            self.camera = FlyCamera::looking_at(
-                position,
-                target,
-                self.camera.speed_m_s,
-                self.camera.projection,
-            );
+            let sampler = world.sampler();
+            let (position, target) = flight.advance(if measuring { dt_s } else { 0.0 }, |dir| {
+                sampler.height_m(dir)
+            });
+            let speed_scale = self.camera.speed_scale;
+            self.camera = FlyCamera::looking_at(position, target, self.camera.projection);
+            self.camera.speed_scale = speed_scale;
         } else {
-            self.camera.update(self.input, dt_s);
+            let altitude = world.altitude_m(self.camera.position.m);
+            self.camera.update(self.input, dt_s, altitude);
         }
     }
 
@@ -619,19 +650,31 @@ impl Running {
                     continue;
                 }
             };
-            if event.path == self.terrain_shader_path {
-                let result = self.renderer.reload_shader("terrain.wgsl", &contents);
-                self.reload_shader("terrain", result);
-            } else if event.path == self.cull_shader_path {
-                let result = self.renderer.reload_shader("terrain_cull.wgsl", &contents);
-                self.reload_shader("cull", result);
+            if let Some(file) = SHADER_FILES
+                .iter()
+                .find(|f| event.path == self.shader_dir.join(f))
+            {
+                let result = self.renderer.reload_shader(file, &contents);
+                self.reload_shader(file, result);
             } else if event.path == self.world_path {
-                match parse_config(&contents, args) {
-                    Ok(config) => self.replace_world(config),
-                    Err(e) => {
+                let system = self.sky.as_ref().map(|s| *s.config());
+                match (parse_config(&contents, args), system) {
+                    (Ok(config), Some(system)) => self.replace_world(config, system),
+                    (Err(e), _) => {
                         tracing::error!("world config rejected, keeping the current world: {e}");
                         self.world_error = Some(e);
                     }
+                    (Ok(_), None) => {}
+                }
+            } else if event.path == self.system_path {
+                let config = self.world.as_ref().map(|w| *w.config());
+                match (parse_system(&contents, args), config) {
+                    (Ok(system), Some(config)) => self.replace_world(config, system),
+                    (Err(e), _) => {
+                        tracing::error!("system config rejected, keeping the current world: {e}");
+                        self.world_error = Some(e);
+                    }
+                    (Ok(_), None) => {}
                 }
             }
         }
@@ -661,20 +704,37 @@ impl Running {
                         startup.load_ms
                     );
                     self.renderer.set_material_textures(&startup.textures);
-                    self.replace_world(startup.config);
-                    if let Some(km) = args.flight_km {
-                        let flight = Flight::new(
-                            km * 1000.0,
-                            args.flight_speed_m_s,
-                            startup.config.chunk_extent_m(),
-                        );
-                        tracing::info!(
-                            "flight: {km} km square at {} m/s, {:.0} s",
-                            args.flight_speed_m_s,
-                            flight.duration_s()
-                        );
-                        self.flight = Some(flight);
+                    self.replace_world(startup.config, startup.system);
+                    if let Some(warp) = args.warp
+                        && let Some(sky) = &mut self.sky
+                    {
+                        sky.set_warp(warp);
                     }
+                    let radius_m = startup.system.planet.params.radius_m();
+                    let up = self.camera.up();
+                    let flight = if args.descent {
+                        Some(Flight::Descent(Descent::new(
+                            radius_m,
+                            up,
+                            self.camera.forward(),
+                            args.descent_top_km * 1000.0,
+                            args.descent_climb_s,
+                        )))
+                    } else {
+                        args.flight_km.map(|km| {
+                            Flight::Loop(SurfaceLoop::new(
+                                radius_m,
+                                up,
+                                km * 1000.0,
+                                args.flight_speed_m_s,
+                                startup.config.chunk_extent_m(),
+                            ))
+                        })
+                    };
+                    if let Some(flight) = &flight {
+                        tracing::info!("scripted flight of {:.0} s", flight.duration_s());
+                    }
+                    self.flight = flight;
                 }
                 Err(e) => {
                     tracing::error!("startup failed: {e}");
@@ -684,30 +744,54 @@ impl Running {
         }
     }
 
-    fn replace_world(&mut self, config: WorldConfig) {
+    fn replace_world(&mut self, config: WorldConfig, system: SystemConfig) {
+        let planet = system.planet.params;
         if let Some(mut old) = self.world.take() {
-            if *old.config() == config {
+            if *old.config() == config && *old.planet() == planet {
                 self.world = Some(old);
                 return;
             }
             old.release(&mut self.renderer);
-            tracing::info!("world config changed, rebuilding the world");
+            tracing::info!("world or planet config changed, rebuilding the world");
         }
-        let world = World::new(config, self.jobs.clone());
+        self.renderer
+            .set_atmosphere(&planet.atmosphere, planet.radius_m());
+        let sky_changed = self.sky.as_ref().is_none_or(|s| *s.config() != system);
+        if sky_changed {
+            self.sky = Some(Sky::new(system));
+        }
+        let mut world = World::new(config, planet, self.jobs.clone(), self.camera.position.m);
         if !self.camera_placed {
-            self.place_camera(&world);
+            self.place_camera(&mut world);
         }
         self.world = Some(world);
         self.world_error = None;
     }
 
-    /// Starts above the origin looking along -Z and down at the terrain.
-    fn place_camera(&mut self, world: &World) {
-        let extent = world.config().chunk_extent_m();
-        let height = world.sampler().height_m(0.0, 0.0) + START_HEIGHT_CHUNKS * extent;
-        let eye = WorldPos::body_fixed(DVec3::new(0.0, height, 0.0));
-        let target = DVec3::new(0.0, height - extent, -3.0 * extent);
-        self.camera = FlyCamera::looking_at(eye, target, START_SPEED_M_S, self.camera.projection);
+    /// Stands on the surface at the start latitude, at the requested local time, facing the sun
+    /// along the horizon (in the morning, the sunrise).
+    fn place_camera(&mut self, world: &mut World) {
+        let lat = START_LATITUDE_DEG.to_radians();
+        let mut dir = DVec3::new(lat.cos(), lat.sin(), 0.0);
+        if let Some(sky) = &mut self.sky {
+            let time_of_day = self.start_time_of_day.unwrap_or(START_TIME_OF_DAY);
+            sky.set_local_time(dir, time_of_day);
+            dir = dir.normalize();
+        }
+        let radius = world.planet().radius_m();
+        let eye = dir * (radius + world.sampler().height_m(dir) + EYE_HEIGHT_M);
+        let sun = self
+            .sky
+            .as_ref()
+            .map_or(tangent_axes(dir).0, |s| s.snapshot().sun_direction);
+        let heading = sun - dir * sun.dot(dir);
+        let heading = heading.normalize_or(tangent_axes(dir).0);
+        self.camera = FlyCamera::looking_at(
+            WorldPos::body_fixed(eye),
+            eye + heading * 100.0 - dir * 3.0,
+            self.camera.projection,
+        );
+        world.set_origin(eye);
         self.camera_placed = true;
     }
 
@@ -733,9 +817,24 @@ impl Running {
             sections: self.sections,
             camera_m: self.camera.position.m,
             speed_m_s: self.camera.speed_m_s,
+            altitude_m: self
+                .world
+                .as_ref()
+                .map_or(0.0, |w| w.altitude_m(self.camera.position.m)),
             voxel_size_m: config.map(|c| c.voxel_size_m),
-            view_radius_chunks: config.map(|_| crate::world::VIEW_RADIUS_CHUNKS),
+            lod: config.map(|c| (c.lod_levels, c.lod_radius_chunks)),
+            planet_radius_km: self.world.as_ref().map(|w| w.planet().radius_km),
             seed: config.map(|c| c.seed),
+            time: self.sky.as_ref().map_or_else(String::new, |sky| {
+                format!(
+                    "{} local, warp {}x, t = {:.0} s",
+                    clock_text(sky.local_time(self.camera.position.m)),
+                    sky.warp(),
+                    sky.time_s()
+                )
+            }),
+            exposure_ev: self.exposure_ev,
+            gpu_timings: self.renderer.gpu_timings(),
             workers: self.jobs.worker_count(),
             world: self.world.as_ref().map(|w| w.stats().clone()),
             pool: Some(self.renderer.pool_stats()),
@@ -846,25 +945,41 @@ impl Running {
         let cull = self.renderer.cull_stats().unwrap_or_default();
         let generate = self.jobs.stats(STAGE_GENERATE);
         let mesh = self.jobs.stats(STAGE_MESH);
+        let planet = self.world.as_ref().map(|w| *w.planet());
+        let drawn = stats.as_ref().map_or_else(String::new, |s| {
+            s.lod
+                .drawn_per_level
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("/")
+        });
+        let gpu = self.renderer.gpu_timings();
         let line = format!(
-            "BENCH voxel_size_m={} view_radius_chunks={} seed={} resolution={}x{} present_mode={} \
-             adapter=\"{}\" workers={} flight_km={} flight_speed_m_s={} edit_test={} edits={} \
-             frames={} seconds={:.1} frame_ms_mean={:.3} frame_ms_p50={:.3} frame_ms_p99={:.3} \
+            "BENCH voxel_size_m={} radius_km={} lod_levels={} lod_radius_chunks={} seed={} \
+             resolution={}x{} present_mode={} adapter=\"{}\" workers={} descent={} \
+             descent_top_km={} flight_km={} flight_speed_m_s={} edit_test={} edits={} frames={} \
+             seconds={:.1} frame_ms_mean={:.3} frame_ms_p50={:.3} frame_ms_p99={:.3} \
              frame_ms_max={:.3} fps={:.1} cpu_ms_mean={:.3} cpu_ms_max={:.3} \
              triangles_visible={} triangles_visible_max={} chunks_visible={} chunks_visible_max={} \
-             chunks_resident={} meshes_resident={} chunks_dense={} voxel_mb={:.1} voxel_mb_peak={:.1} \
+             nodes={} meshes_resident={} drawn_per_level={} voxel_mb={:.1} voxel_mb_peak={:.1} \
              gpu_vertex_mb={:.1} gpu_index_mb={:.1} gpu_pool_mb={:.1} upload_mb_frame_peak={:.2} \
              queue_peak={} generate_ms_mean={:.3} generate_ms_max={:.3} mesh_ms_mean={:.3} \
-             mesh_ms_max={:.3} generated={} meshed={} uploaded={} upload_failures={} \
-             recentre_ms_max={:.3} world_update_ms_max={:.3}",
+             mesh_ms_max={:.3} generated={} meshed={} uploaded={} upload_failures={} splits={} \
+             merges={} lod_ms_max={:.3} rebases={} rebase_ms_max={:.3} world_update_ms_max={:.3} \
+             gpu_ms={:.3}",
             config.map_or(f64::NAN, |c| c.voxel_size_m),
-            config.map_or(0, |_| crate::world::VIEW_RADIUS_CHUNKS),
+            planet.map_or(f64::NAN, |p| p.radius_km),
+            config.map_or(0, |c| c.lod_levels),
+            config.map_or(f64::NAN, |c| c.lod_radius_chunks),
             config.map_or(0, |c| c.seed),
             w,
             h,
             info.present_mode,
             info.adapter,
             self.jobs.worker_count(),
+            args.descent,
+            args.descent_top_km,
             args.flight_km.unwrap_or(0.0),
             args.flight_speed_m_s,
             args.edit_test,
@@ -882,9 +997,9 @@ impl Running {
             self.peaks.triangles_max,
             cull.visible_chunks,
             self.peaks.visible_max,
-            stats.as_ref().map_or(0, |s| s.resident),
+            stats.as_ref().map_or(0, |s| s.nodes),
             stats.as_ref().map_or(0, |s| s.meshed),
-            stats.as_ref().map_or(0, |s| s.dense),
+            drawn,
             stats.as_ref().map_or(0.0, |s| s.voxel_bytes as f64 / 1.0e6),
             stats
                 .as_ref()
@@ -904,26 +1019,40 @@ impl Running {
             stats.as_ref().map_or(0, |s| s.meshed_total),
             stats.as_ref().map_or(0, |s| s.uploaded_total),
             stats.as_ref().map_or(0, |s| s.upload_failures),
-            stats.as_ref().map_or(0.0, |s| s.stream_ms_max),
+            stats.as_ref().map_or(0, |s| s.lod.splits_total),
+            stats.as_ref().map_or(0, |s| s.lod.merges_total),
+            stats.as_ref().map_or(0.0, |s| s.lod_ms_max),
+            stats.as_ref().map_or(0, |s| s.rebases),
+            stats.as_ref().map_or(0.0, |s| s.rebase_ms_max),
             stats.as_ref().map_or(0.0, |s| s.update_ms_max),
+            gpu.map_or(f64::NAN, |g| g.total_ms()),
         );
         println!("{line}");
     }
 }
 
-/// Loads the world config and generates the material textures on a thread, so the main thread
-/// never reads a file or runs generation (D9).
-fn spawn_startup(args: &Args, world_path: &std::path::Path, tx: Sender<Result<Startup, String>>) {
+/// Loads the world and system configs and generates the material textures on a thread, so the
+/// main thread never reads a file or runs generation (D9).
+fn spawn_startup(
+    args: &Args,
+    world_path: &std::path::Path,
+    system_path: &std::path::Path,
+    tx: Sender<Result<Startup, String>>,
+) {
     let args = args.clone();
     let world_path = world_path.to_path_buf();
+    let system_path = system_path.to_path_buf();
     let spawned = std::thread::Builder::new()
         .name("vx-startup".into())
         .spawn(move || {
             let start = Instant::now();
             let result = (|| {
-                let text = std::fs::read_to_string(&world_path)
-                    .map_err(|e| format!("reading {}: {e}", world_path.display()))?;
-                let config = parse_config(&text, &args)?;
+                let read = |path: &std::path::Path| {
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("reading {}: {e}", path.display()))
+                };
+                let config = parse_config(&read(&world_path)?, &args)?;
+                let system = parse_system(&read(&system_path)?, &args)?;
                 let generated = material_textures(config.seed, MATERIAL_TEXTURE_SIZE);
                 let textures = MaterialTextures {
                     size: generated.size,
@@ -932,6 +1061,7 @@ fn spawn_startup(args: &Args, world_path: &std::path::Path, tx: Sender<Result<St
                 .prepare()?;
                 Ok(Startup {
                     config,
+                    system,
                     textures,
                     load_ms: start.elapsed().as_secs_f64() * 1.0e3,
                 })
@@ -944,7 +1074,7 @@ fn spawn_startup(args: &Args, world_path: &std::path::Path, tx: Sender<Result<St
     }
 }
 
-/// Parses the config text and applies the one run overrides, validating the result.
+/// Parses the world config text and applies the one run overrides, validating the result.
 fn parse_config(text: &str, args: &Args) -> Result<WorldConfig, String> {
     let mut config = WorldConfig::from_ron_str(text).map_err(|e| e.to_string())?;
     if let Some(v) = args.voxel_size_m {
@@ -953,6 +1083,22 @@ fn parse_config(text: &str, args: &Args) -> Result<WorldConfig, String> {
     if let Some(s) = args.seed {
         config.seed = s;
     }
+    if let Some(r) = args.lod_radius_chunks {
+        config.lod_radius_chunks = r;
+    }
+    if let Some(l) = args.lod_levels {
+        config.lod_levels = l;
+    }
     config.validate().map_err(|e| e.to_string())?;
     Ok(config)
+}
+
+/// Parses the system config text and applies the planet radius override, validating the result.
+fn parse_system(text: &str, args: &Args) -> Result<SystemConfig, String> {
+    let mut system = SystemConfig::from_ron_str(text).map_err(|e| e.to_string())?;
+    if let Some(r) = args.radius_km {
+        system.planet.params.radius_km = r;
+    }
+    system.validate().map_err(|e| e.to_string())?;
+    Ok(system)
 }

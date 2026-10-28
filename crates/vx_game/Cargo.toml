@@ -21,6 +21,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 vx_core.workspace = true
 vx_render.workspace = true
+vx_universe.workspace = true
 vx_voxel.workspace = true
 vx_worldgen.workspace = true
 winit.workspace = true

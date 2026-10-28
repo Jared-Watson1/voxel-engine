@@ -3087,6 +3087,7 @@ dependencies = [
  "tracing-subscriber",
  "vx_core",
  "vx_render",
+ "vx_universe",
  "vx_voxel",
  "vx_worldgen",
  "winit",
