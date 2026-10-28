@@ -37,6 +37,9 @@ pub struct Args {
     pub exposure_ev: f32,
     /// Start this high above the terrain, looking down at the planet, instead of standing.
     pub altitude_km: Option<f64>,
+    /// Start position in degrees (longitude east positive from the prime meridian).
+    pub latitude_deg: Option<f64>,
+    pub longitude_deg: Option<f64>,
     /// Apply a scripted dig or place every few frames during the measurement.
     pub edit_test: bool,
     /// Brush radius in voxels at startup.
@@ -76,6 +79,8 @@ OPTIONS:
     --warp <x>              simulation seconds per real second at startup (default 1)
     --exposure <ev>         exposure in stops (default 0.5)
     --altitude <km>         start this high above the terrain looking down at the planet
+    --latitude <deg>        start latitude (default 25)
+    --longitude <deg>       start longitude, east positive (default 0)
     --edit-test             apply scripted brushes during the measurement
     --brush-radius <voxels> brush radius at startup (default 3)
     --no-overlay            hide the debug overlay
@@ -122,6 +127,8 @@ impl Args {
             warp: None,
             exposure_ev: DEFAULT_EXPOSURE_EV,
             altitude_km: None,
+            latitude_deg: None,
+            longitude_deg: None,
             edit_test: false,
             brush_radius_voxels: None,
             no_overlay: false,
@@ -143,6 +150,8 @@ impl Args {
                 "--warp" => args.warp = Some(value()?.parse()?),
                 "--exposure" => args.exposure_ev = value()?.parse()?,
                 "--altitude" => args.altitude_km = Some(value()?.parse()?),
+                "--latitude" => args.latitude_deg = Some(value()?.parse()?),
+                "--longitude" => args.longitude_deg = Some(value()?.parse()?),
                 "--seed" => args.seed = Some(value()?.parse()?),
                 "--workers" => args.workers = Some(value()?.parse()?),
                 "--no-vsync" => args.vsync = false,

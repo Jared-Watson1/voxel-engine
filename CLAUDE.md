@@ -108,7 +108,7 @@ cargo run --release -p vx_game -- --descent                     stand, climb to 
 cargo run --release -p vx_game -- --descent --radius-km 50 --voxel-size 0.5 --lod-levels 10   the M2 parameter run
 cargo run --release -p vx_game -- --flight-km 2                 fly a 2 km square loop over the surface, print a BENCH line, exit
 cargo run --release -p vx_game -- --bench-seconds 30 --edit-test  measure standing still with scripted dig and place brushes
-cargo run --release -p vx_game -- --time-of-day 0.27 --altitude 8   start at a local solar time, optionally high above the terrain
+cargo run --release -p vx_game -- --time-of-day 0.27 --altitude 8   start at a local solar time, optionally high above the terrain (also --latitude, --longitude)
 cargo run --release -p vx_game -- --no-vsync --warp 60 --exposure 1  uncapped, time warp, exposure (also --seed, --workers, --lod-radius)
 cargo run --release -p vx_game -- --screenshot out.png          save a PNG after the world settles and exit (add --no-overlay)
 cargo run --release -p vx_tools -- bench-chunk --level 3        generate, transition slabs and mesh per surface chunk, cold and warm cache

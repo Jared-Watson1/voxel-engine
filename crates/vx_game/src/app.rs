@@ -147,6 +147,7 @@ struct Running {
     exposure_ev: f32,
     start_time_of_day: Option<f64>,
     start_altitude_km: Option<f64>,
+    start_lat_lon_deg: (f64, f64),
     world_error: Option<String>,
     shader_error: Option<String>,
     brush: BrushSettings,
@@ -367,6 +368,10 @@ impl Running {
             exposure_ev: args.exposure_ev,
             start_time_of_day: args.time_of_day,
             start_altitude_km: args.altitude_km,
+            start_lat_lon_deg: (
+                args.latitude_deg.unwrap_or(START_LATITUDE_DEG),
+                args.longitude_deg.unwrap_or(0.0),
+            ),
             world_error: None,
             shader_error: None,
             brush: BrushSettings {
@@ -800,8 +805,12 @@ impl Running {
     /// Stands on the surface at the start latitude, at the requested local time, facing the sun
     /// along the horizon (in the morning, the sunrise).
     fn place_camera(&mut self, world: &mut World) {
-        let lat = START_LATITUDE_DEG.to_radians();
-        let mut dir = DVec3::new(lat.cos(), lat.sin(), 0.0);
+        // Body fixed axes: +Y north, +X the prime meridian, east towards -Z (vx_universe).
+        let (lat, lon) = (
+            self.start_lat_lon_deg.0.to_radians(),
+            self.start_lat_lon_deg.1.to_radians(),
+        );
+        let mut dir = DVec3::new(lat.cos() * lon.cos(), lat.sin(), -lat.cos() * lon.sin());
         if let Some(sky) = &mut self.sky {
             let time_of_day = self.start_time_of_day.unwrap_or(START_TIME_OF_DAY);
             sky.set_local_time(dir, time_of_day);
