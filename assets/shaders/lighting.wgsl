@@ -185,9 +185,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             let margin = (atmosphere_radius_rad - from_centre) / max(frame.params.w, 1.0e-4);
             froxel_weight *= smoothstep(1.0, 2.0, margin);
         }
-        if along >= range {
-            froxel_weight = 0.0;
-        }
+        // Beyond the froxels (only valleys below the mean radius) the march takes over gradually.
+        froxel_weight *= 1.0 - smoothstep(0.9 * range, range, along);
         march_weight = 1.0 - froxel_weight;
         if froxel_weight > 0.0 {
             let w = sqrt(max(along, 0.0) / range);
