@@ -1,8 +1,10 @@
-//! GPU frustum culling and index compaction (D10, D19) and the non blocking readback of the
-//! culling counters. Two compute entry points in `assets/shaders/terrain_cull.wgsl`: `cull` runs
-//! one thread per chunk slot and appends visible chunks to a list while reserving their index
-//! range with an atomic; `compact` runs one workgroup per visible chunk and copies its indices,
-//! rebased by the chunk's vertex base, into the compacted index buffer.
+//! GPU frustum and horizon culling and index compaction (D10, D19, D22, D23) and the non blocking
+//! readback of the culling counters. Two compute entry points in `assets/shaders/terrain_cull.wgsl`:
+//! `cull` runs one thread per chunk slot, tests the chunk's own box (32 of its voxels on a side)
+//! against the frustum and the planet's occluder sphere, and appends visible chunks to a list
+//! while reserving their regular range plus the transition ranges of their masked faces with one
+//! atomic add; `compact` runs one workgroup per visible chunk and copies those ranges, rebased by
+//! the chunk's vertex base, into the compacted index buffer.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -24,8 +26,13 @@ pub(crate) const CULL_WORKGROUP_SIZE: u32 = 64;
 /// One below the u16 range: the compaction pass dispatches one workgroup per visible chunk and
 /// `max_compute_workgroups_per_dimension` is 65535.
 pub(crate) const MAX_SLOTS: usize = (1 << 16) - 1;
-/// `ChunkEntry::flags` bit 0: the slot is resident and listed this frame.
-pub(crate) const FLAG_RESIDENT: u32 = 1;
+/// `ChunkEntry::flags` bit 0: the slot holds a mesh whose placement is visible.
+pub(crate) const FLAG_VISIBLE: u32 = 1;
+/// `ChunkEntry::flags` bits 8 to 13 hold the transition mask, bit `8 + face`.
+pub(crate) const CHUNK_MASK_SHIFT: u32 = 8;
+/// Relative slack of the horizon test; matches `HORIZON_MARGIN` in the shader.
+#[cfg(test)]
+pub(crate) const HORIZON_MARGIN: f32 = 1.0e-4;
 
 /// Matches `struct Counters` in `terrain_cull.wgsl`: indexed indirect draw arguments
 /// (`wgpu::util::DrawIndexedIndirectArgs` layout) followed by the indirect dispatch arguments of
@@ -105,6 +112,27 @@ pub(crate) fn aabb_visible(planes: &[[f32; 4]; 6], min_m: Vec3, max_m: Vec3) -> 
         let n = Vec3::new(plane[0], plane[1], plane[2]);
         let corner = Vec3::select(n.cmpgt(Vec3::ZERO), max_m, min_m);
         n.dot(corner) + plane[3] >= 0.0
+    })
+}
+
+/// CPU mirror of `horizon_hidden` in `terrain_cull.wgsl`, for tests: whether the camera relative
+/// box lies entirely behind the occluder sphere at `centre_m` (camera relative) of `radius_m`.
+#[cfg(test)]
+pub(crate) fn horizon_hidden(centre_m: Vec3, radius_m: f32, min_m: Vec3, max_m: Vec3) -> bool {
+    let d = centre_m.length();
+    if radius_m <= 0.0 || d <= radius_m {
+        return false;
+    }
+    let inv_d = 1.0 / d;
+    let c = centre_m * inv_d;
+    let rs = radius_m * inv_d;
+    let h2 = (1.0 - rs) * (1.0 + rs);
+    let plane = h2 * (1.0 + HORIZON_MARGIN);
+    (0..8).all(|i| {
+        let pick = glam::BVec3::new(i & 1 != 0, i & 2 != 0, i & 4 != 0);
+        let p = Vec3::select(pick, max_m, min_m) * inv_d;
+        let pc = p.dot(c);
+        pc > plane && pc * pc > plane * p.dot(p)
     })
 }
 
@@ -325,7 +353,7 @@ impl CullPass {
         let visible = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terrain visible list"),
             size: (MAX_SLOTS * size_of::<VisibleEntry>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         // The sum of visible index counts never exceeds the index pool, so the compacted copy is
@@ -413,6 +441,11 @@ impl CullPass {
 
     pub(crate) fn compacted(&self) -> &wgpu::Buffer {
         &self.compacted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible(&self) -> &wgpu::Buffer {
+        &self.visible
     }
 
     /// Queued before the frame's commands, so the GPU sees zeroed counters when `cull` runs.
@@ -614,6 +647,72 @@ mod tests {
             assert!((n - 1.0).abs() < 1.0e-5, "plane {i} has length {n}");
         }
         assert_eq!(planes()[5], [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// Whether the segment from the camera (origin) to `p` passes through the ball, in f64.
+    fn segment_hits_ball(p: glam::DVec3, centre: glam::DVec3, radius: f64) -> bool {
+        let t = (p.dot(centre) / p.length_squared()).clamp(0.0, 1.0);
+        (p * t - centre).length() < radius
+    }
+
+    #[test]
+    fn horizon_test_is_conservative() {
+        // A small linear congruential generator keeps the test deterministic without a dependency.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut hidden = 0;
+        for case in 0..20_000 {
+            let radius = 1_000.0 + next() * 50_000.0;
+            let altitude = radius * (0.0001 + next() * if case % 2 == 0 { 0.1 } else { 20.0 });
+            let centre = glam::DVec3::new(0.0, -(radius + altitude), 0.0);
+            let extent = 32.0 * 2f64.powi((next() * 8.0) as i32);
+            let reach = 3.0 * (radius + altitude);
+            let min = glam::DVec3::new(
+                (next() - 0.5) * reach,
+                (next() - 0.9) * reach,
+                (next() - 0.5) * reach,
+            );
+            let max = min + extent;
+            if !horizon_hidden(
+                centre.as_vec3(),
+                radius as f32,
+                min.as_vec3(),
+                max.as_vec3(),
+            ) {
+                continue;
+            }
+            hidden += 1;
+            for i in 0..8 {
+                let pick = glam::BVec3::new(i & 1 != 0, i & 2 != 0, i & 4 != 0);
+                let corner = glam::DVec3::select(pick, max, min);
+                assert!(
+                    segment_hits_ball(corner, centre, radius),
+                    "case {case}: corner {corner} of a culled box is visible past a ball of \
+                     radius {radius} at {centre}"
+                );
+            }
+        }
+        assert!(hidden > 1_000, "only {hidden} boxes were hidden");
+    }
+
+    #[test]
+    fn horizon_test_is_off_without_an_occluder_or_inside_it() {
+        let behind = (
+            Vec3::new(-1.0, -30_000.0, -1.0),
+            Vec3::new(1.0, -29_000.0, 1.0),
+        );
+        let centre = Vec3::new(0.0, -20_000.0, 0.0);
+        assert!(horizon_hidden(centre, 10_000.0, behind.0, behind.1));
+        assert!(!horizon_hidden(centre, 0.0, behind.0, behind.1));
+        assert!(!horizon_hidden(centre, -5.0, behind.0, behind.1));
+        assert!(!horizon_hidden(centre, 25_000.0, behind.0, behind.1));
+        let at_camera = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        assert!(!horizon_hidden(centre, 10_000.0, at_camera.0, at_camera.1));
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! The terrain pass (D10, D14, D19, D22, D23): pooled vertex and index buffers with a range
-//! allocator each, a slot table of resident meshes with their placements, the chunk table and
-//! uniform, and the render pipeline that pulls packed vertices from the pool through the
-//! compacted index buffer into the G-buffer. Culling lives in [`crate::cull`], the material array
-//! in [`crate::materials`].
+//! allocator each, a slot table of resident meshes with their placements, the persistent chunk
+//! table and the frame uniform, and the render pipeline that pulls packed vertices from the pool
+//! through the compacted index buffer into the G-buffer. Culling lives in [`crate::cull`], the
+//! material array in [`crate::materials`].
 //!
-//! M2 interface commit: the chunk table is still the M1 layout rebuilt each frame from the stored
-//! placements (offset minus the camera offset), with one voxel size and regular ranges only.
-//! Workstream E replaces it with the persistent 64 byte table of D23 and the transition ranges.
+//! The chunk table (D23) holds one 64 byte [`ChunkEntry`] per slot with the chunk's placement
+//! relative to the render origin, its own voxel size and its transition mask. A CPU mirror is kept
+//! in step with the slots; an entry is marked dirty when an upload, a placement change or a free
+//! touches it, and only the dirty runs are written before the next frame. The frame uniform
+//! carries the camera's offset from the render origin, so a camera move writes no entry.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -14,15 +16,15 @@ use std::collections::BinaryHeap;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use vx_core::{CHUNK_SIZE, PackedVertex};
+use vx_core::PackedVertex;
 
-use crate::cull::{CullPass, FLAG_RESIDENT, MAX_SLOTS, frustum_planes};
+use crate::cull::{CHUNK_MASK_SHIFT, CullPass, FLAG_VISIBLE, MAX_SLOTS, frustum_planes};
 use crate::materials::MaterialArray;
 use crate::pool::{Range, RangeAllocator};
 use crate::{
     ChunkPlacement, CullStats, DEPTH_COMPARE, DEPTH_FORMAT, FrameInput, GBUFFER_ALBEDO_FORMAT,
-    GBUFFER_NORMAL_FORMAT, MATERIAL_TILE_M, MeshHandle, MeshUpload, PoolError, PoolStats,
-    PreparedMaterialTextures, TerrainPoolConfig,
+    GBUFFER_NORMAL_FORMAT, MATERIAL_TILE_M, MeshHandle, MeshUpload, PlanetView, PoolError,
+    PoolStats, PreparedMaterialTextures, TerrainPoolConfig,
 };
 
 /// Built in copy of `assets/shaders/terrain.wgsl`, so the first frame needs no file I/O. The file
@@ -30,85 +32,133 @@ use crate::{
 pub(crate) const TERRAIN_WGSL: &str = include_str!("../../../assets/shaders/terrain.wgsl");
 
 /// Matches `struct Frame` in `assets/shaders/terrain.wgsl` and `terrain_cull.wgsl` (engineering
-/// rule 9). Everything is camera relative (D4).
+/// rule 9). Everything is relative to the camera or the render origin (D4, D23).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct FrameUniform {
+    /// Projection times the rotation only view matrix.
     pub view_proj: [[f32; 4]; 4],
     /// Frustum planes as (normal, distance), inside positive; the sixth always passes because the
     /// far plane is at infinity.
     pub planes: [[f32; 4]; 6],
-    /// xyz: unit direction towards the sun. w: ambient strength.
-    pub sun_dir: [f32; 4],
-    /// Voxel size, chunk extent and material tile length in metres; the fourth is unused.
-    pub params: [f32; 4],
+    /// xyz: camera position relative to the render origin. w: material tile length.
+    pub camera_offset_m: [f32; 4],
+    /// xyz: planet centre relative to the camera. w: occluder radius, 0 to disable the horizon
+    /// test.
+    pub planet: [f32; 4],
     pub slot_count: u32,
-    pub padding: [u32; 3],
+    /// Always 0. The vertex shader ORs it into the bits of every intermediate of the secondary
+    /// position so Metal's fast math cannot fuse or reorder that arithmetic: a uniform is a value
+    /// the shader compiler cannot fold (D22).
+    pub zero: u32,
+    pub padding: [u32; 2],
 }
 
 const _: () = assert!(size_of::<FrameUniform>() == 208);
 const _: () = assert!(std::mem::offset_of!(FrameUniform, planes) == 64);
-const _: () = assert!(std::mem::offset_of!(FrameUniform, sun_dir) == 160);
-const _: () = assert!(std::mem::offset_of!(FrameUniform, params) == 176);
+const _: () = assert!(std::mem::offset_of!(FrameUniform, camera_offset_m) == 160);
+const _: () = assert!(std::mem::offset_of!(FrameUniform, planet) == 176);
 const _: () = assert!(std::mem::offset_of!(FrameUniform, slot_count) == 192);
+const _: () = assert!(std::mem::offset_of!(FrameUniform, zero) == 196);
 
 impl FrameUniform {
     pub fn new(
         view_proj: Mat4,
-        sun_dir: Vec3,
-        ambient: f32,
-        voxel_size_m: f32,
+        camera_offset_m: Vec3,
+        planet: &PlanetView,
         slot_count: u32,
     ) -> Self {
         Self {
             view_proj: view_proj.to_cols_array_2d(),
             planes: frustum_planes(view_proj),
-            sun_dir: sun_dir.normalize_or_zero().extend(ambient).to_array(),
-            params: [
-                voxel_size_m,
-                CHUNK_SIZE as f32 * voxel_size_m,
-                MATERIAL_TILE_M as f32,
-                0.0,
-            ],
+            camera_offset_m: camera_offset_m.extend(MATERIAL_TILE_M as f32).to_array(),
+            planet: planet
+                .centre_m
+                .extend(planet.occluder_radius_m.max(0.0))
+                .to_array(),
             slot_count,
-            padding: [0; 3],
+            zero: 0,
+            padding: [0; 2],
         }
     }
 }
 
-/// Matches `struct ChunkEntry` in both shaders: 48 bytes, a multiple of the 16 byte alignment
-/// the vec3 members give the WGSL struct, so the array stride agrees.
+/// One chunk table entry (D23), matching `struct ChunkEntry` in both terrain shaders. 64 bytes:
+/// the vec3 members give the WGSL struct a 16 byte alignment and 64 is a multiple of it, so the
+/// array strides agree.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, Pod, Zeroable)]
 pub(crate) struct ChunkEntry {
+    /// Chunk origin relative to the render origin.
     pub offset_m: [f32; 3],
+    /// First vertex of the mesh in the vertex pool, added to its mesh local indices.
     pub vertex_base: u32,
     pub texture_phase_m: [f32; 3],
+    /// First index of the mesh in the index pool: the regular range, then the six transition
+    /// ranges in face order.
     pub index_base: u32,
-    pub index_count: u32,
+    pub regular_count: u32,
+    /// Transition range index counts as u16 pairs: face `2k` in the low half of element `k`,
+    /// face `2k + 1` in the high half.
+    pub transition_counts: [u32; 3],
+    pub voxel_size_m: f32,
+    /// [`FLAG_VISIBLE`] and the transition mask at [`CHUNK_MASK_SHIFT`].
     pub flags: u32,
     pub padding: [u32; 2],
 }
 
-const _: () = assert!(size_of::<ChunkEntry>() == 48);
+const _: () = assert!(size_of::<ChunkEntry>() == 64);
 const _: () = assert!(std::mem::offset_of!(ChunkEntry, vertex_base) == 12);
 const _: () = assert!(std::mem::offset_of!(ChunkEntry, texture_phase_m) == 16);
 const _: () = assert!(std::mem::offset_of!(ChunkEntry, index_base) == 28);
-const _: () = assert!(std::mem::offset_of!(ChunkEntry, index_count) == 32);
-const _: () = assert!(std::mem::offset_of!(ChunkEntry, flags) == 36);
+const _: () = assert!(std::mem::offset_of!(ChunkEntry, regular_count) == 32);
+const _: () = assert!(std::mem::offset_of!(ChunkEntry, transition_counts) == 36);
+const _: () = assert!(std::mem::offset_of!(ChunkEntry, voxel_size_m) == 48);
+const _: () = assert!(std::mem::offset_of!(ChunkEntry, flags) == 52);
+
+impl ChunkEntry {
+    fn new(mesh: &ResidentMesh) -> Self {
+        let t = mesh.transition_counts.map(u32::from);
+        let placement = &mesh.placement;
+        let visible = if placement.visible { FLAG_VISIBLE } else { 0 };
+        Self {
+            offset_m: placement.offset_m.to_array(),
+            vertex_base: mesh.vertex_base,
+            texture_phase_m: placement.texture_phase_m.to_array(),
+            index_base: mesh.index_base,
+            regular_count: mesh.regular_count,
+            transition_counts: [t[0] | t[1] << 16, t[2] | t[3] << 16, t[4] | t[5] << 16],
+            voxel_size_m: placement.voxel_size_m,
+            flags: visible | u32::from(placement.transition_mask & 0x3f) << CHUNK_MASK_SHIFT,
+            padding: [0; 2],
+        }
+    }
+}
 
 const VERTEX_BYTES: usize = size_of::<PackedVertex>();
 const INDEX_BYTES: usize = size_of::<u32>();
+const ENTRY_BYTES: usize = size_of::<ChunkEntry>();
 /// Entries in the chunk table buffer at creation; it doubles when the slot count passes it.
 const INITIAL_TABLE_ENTRIES: usize = 1024;
+/// Clean entries between two dirty runs that are rewritten anyway to save a write call; a write
+/// costs more than a few hundred bytes of copy.
+const DIRTY_RUN_GAP: usize = 4;
 
 struct ResidentMesh {
     vertex_range: Range,
     index_range: Range,
     vertex_base: u32,
     index_base: u32,
-    index_count: u32,
+    regular_count: u32,
+    transition_counts: [u16; 6],
     placement: ChunkPlacement,
+}
+
+/// Chunk table writes of one [`TerrainPass::prepare_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TableWrites {
+    pub entries: usize,
+    pub calls: usize,
 }
 
 pub(crate) struct TerrainPass {
@@ -123,7 +173,15 @@ pub(crate) struct TerrainPass {
     free_slots: BinaryHeap<Reverse<u16>>,
     mesh_count: usize,
     staging: Vec<PackedVertex>,
+    /// CPU mirror of the chunk table, one entry per slot (zeroed for a free slot).
     table: Vec<ChunkEntry>,
+    /// Slots whose entry changed since the last frame, unordered and without repeats.
+    dirty: Vec<u16>,
+    is_dirty: Vec<bool>,
+    /// Set when the table buffer was replaced, which loses every entry.
+    rewrite_table: bool,
+    #[cfg(test)]
+    last_writes: TableWrites,
     table_buffer: wgpu::Buffer,
     uniform: wgpu::Buffer,
     frame_layout: wgpu::BindGroupLayout,
@@ -208,6 +266,11 @@ impl TerrainPass {
             mesh_count: 0,
             staging: Vec::new(),
             table: Vec::new(),
+            dirty: Vec::new(),
+            is_dirty: Vec::new(),
+            rewrite_table: false,
+            #[cfg(test)]
+            last_writes: TableWrites::default(),
             table_buffer,
             uniform,
             frame_layout,
@@ -245,6 +308,17 @@ impl TerrainPass {
         if vertices.is_empty() || indices.is_empty() {
             return Err(PoolError::EmptyMesh);
         }
+        let Some(transition_counts) = checked_counts(mesh) else {
+            // PoolError has no variant for inconsistent counts; the mesher never produces them.
+            tracing::error!(
+                "upload_mesh: index counts (regular {}, transitions {:?}) do not describe {} \
+                 indices with u16 transition ranges; mesh rejected",
+                mesh.regular_index_count,
+                mesh.transition_index_counts,
+                indices.len()
+            );
+            return Err(PoolError::EmptyMesh);
+        };
         let slot = self.take_slot()?;
         let vertex_range = match self.vertex_alloc.allocate(vertices.len() * VERTEX_BYTES) {
             Ok(range) => range,
@@ -280,23 +354,35 @@ impl TerrainPass {
             index_range.offset as u64,
             bytemuck::cast_slice(indices),
         );
-        self.slots[usize::from(slot)] = Some(ResidentMesh {
+        let resident = ResidentMesh {
             vertex_range,
             index_range,
             vertex_base: (vertex_range.offset / VERTEX_BYTES) as u32,
             index_base: (index_range.offset / INDEX_BYTES) as u32,
-            index_count: mesh.regular_index_count.min(indices.len() as u32),
+            regular_count: mesh.regular_index_count,
+            transition_counts,
             placement,
-        });
+        };
+        self.write_entry(slot, ChunkEntry::new(&resident));
+        self.slots[usize::from(slot)] = Some(resident);
         self.mesh_count += 1;
         Ok(MeshHandle(slot))
     }
 
     pub(crate) fn set_placement(&mut self, handle: MeshHandle, placement: ChunkPlacement) {
-        match self.slots.get_mut(usize::from(handle.0)) {
-            Some(Some(mesh)) => mesh.placement = placement,
-            _ => tracing::warn!("set_placement: slot {} holds no mesh", handle.0),
-        }
+        let slot = handle.0;
+        let entry = match self.slots.get_mut(usize::from(slot)) {
+            Some(Some(mesh)) if mesh.placement != placement => {
+                mesh.placement = placement;
+                ChunkEntry::new(mesh)
+            }
+            Some(Some(_)) => return,
+            _ => {
+                tracing::warn!("set_placement: slot {slot} holds no mesh");
+                return;
+            }
+        };
+        self.write_entry(slot, entry);
     }
 
     pub(crate) fn free_mesh(&mut self, handle: MeshHandle) {
@@ -307,6 +393,7 @@ impl TerrainPass {
                 self.index_alloc.free(mesh.index_range);
                 self.mesh_count -= 1;
                 self.free_slots.push(Reverse(slot));
+                self.write_entry(slot, ChunkEntry::zeroed());
             }
             None => tracing::warn!("free_mesh: slot {slot} holds no mesh"),
         }
@@ -320,7 +407,19 @@ impl TerrainPass {
             return Err(PoolError::NoFreeSlot);
         }
         self.slots.push(None);
+        self.table.push(ChunkEntry::zeroed());
+        self.is_dirty.push(false);
         Ok((self.slots.len() - 1) as u16)
+    }
+
+    /// Updates the CPU mirror and queues the entry for the next frame's table write.
+    fn write_entry(&mut self, slot: u16, entry: ChunkEntry) {
+        let i = usize::from(slot);
+        self.table[i] = entry;
+        if !self.is_dirty[i] {
+            self.is_dirty[i] = true;
+            self.dirty.push(slot);
+        }
     }
 
     pub(crate) fn set_material_textures(
@@ -352,8 +451,8 @@ impl TerrainPass {
         self.cull.cull_stats(self.frame_index)
     }
 
-    /// Collects finished readbacks, builds the chunk table and writes the frame's uniform and
-    /// counters. Queue writes land before the frame's submission.
+    /// Collects finished readbacks, writes the changed chunk table entries and the frame's
+    /// uniform and counters. Queue writes land before the frame's submission.
     pub(crate) fn prepare_frame(
         &mut self,
         device: &wgpu::Device,
@@ -364,30 +463,8 @@ impl TerrainPass {
         self.frame_index += 1;
         self.cull.poll_readback(device);
 
-        let slot_count = self.slots.len().max(1);
-        self.table.clear();
-        self.table.resize(slot_count, ChunkEntry::zeroed());
-        let mut voxel_size_m = 1.0;
-        for (slot, mesh) in self.slots.iter().enumerate() {
-            let Some(mesh) = mesh else {
-                continue;
-            };
-            if !mesh.placement.visible {
-                continue;
-            }
-            voxel_size_m = mesh.placement.voxel_size_m;
-            self.table[slot] = ChunkEntry {
-                offset_m: (mesh.placement.offset_m - frame.camera_offset_m).to_array(),
-                vertex_base: mesh.vertex_base,
-                texture_phase_m: mesh.placement.texture_phase_m.to_array(),
-                index_base: mesh.index_base,
-                index_count: mesh.index_count,
-                flags: FLAG_RESIDENT,
-                padding: [0; 2],
-            };
-        }
-
-        let capacity = self.table_buffer.size() as usize / size_of::<ChunkEntry>();
+        let slot_count = self.slots.len();
+        let capacity = self.table_buffer.size() as usize / ENTRY_BYTES;
         if slot_count > capacity {
             let mut entries = capacity.max(1);
             while entries < slot_count {
@@ -403,19 +480,48 @@ impl TerrainPass {
             );
             self.cull
                 .rebind_chunk_table(device, &self.uniform, &self.table_buffer);
+            self.rewrite_table = true;
         }
-        queue.write_buffer(&self.table_buffer, 0, bytemuck::cast_slice(&self.table));
+        let _writes = self.write_table(queue);
+        #[cfg(test)]
+        {
+            self.last_writes = _writes;
+        }
 
         let uniform = FrameUniform::new(
             frame.view_proj,
-            frame.sun.direction,
-            0.0,
-            voxel_size_m,
+            frame.camera_offset_m,
+            &frame.planet,
             slot_count as u32,
         );
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         self.cull.reset_counters(queue);
         self.slot_count_this_frame = slot_count as u32;
+    }
+
+    fn write_table(&mut self, queue: &wgpu::Queue) -> TableWrites {
+        profiling::scope!("terrain chunk table");
+        let runs = if std::mem::take(&mut self.rewrite_table) {
+            self.dirty.clear();
+            vec![std::ops::Range {
+                start: 0,
+                end: self.table.len(),
+            }]
+        } else {
+            dirty_runs(&mut self.dirty, DIRTY_RUN_GAP)
+        };
+        let mut writes = TableWrites::default();
+        for run in runs.into_iter().filter(|run| !run.is_empty()) {
+            queue.write_buffer(
+                &self.table_buffer,
+                (run.start * ENTRY_BYTES) as u64,
+                bytemuck::cast_slice(&self.table[run.clone()]),
+            );
+            self.is_dirty[run.clone()].fill(false);
+            writes.entries += run.len();
+            writes.calls += 1;
+        }
+        writes
     }
 
     pub(crate) fn encode_cull(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -450,6 +556,36 @@ impl TerrainPass {
     }
 }
 
+/// The six transition counts as u16 when they and the regular count sum to the index count.
+fn checked_counts(mesh: &MeshUpload) -> Option<[u16; 6]> {
+    let total = mesh
+        .transition_index_counts
+        .iter()
+        .try_fold(mesh.regular_index_count, |sum, &c| sum.checked_add(c))?;
+    if total as usize != mesh.indices.len() {
+        return None;
+    }
+    let mut counts = [0u16; 6];
+    for (out, &c) in counts.iter_mut().zip(&mesh.transition_index_counts) {
+        *out = u16::try_from(c).ok()?;
+    }
+    Some(counts)
+}
+
+/// Sorts and drains the dirty slots into runs of entries to write, joining runs separated by at
+/// most `gap` clean entries.
+fn dirty_runs(dirty: &mut Vec<u16>, gap: usize) -> Vec<std::ops::Range<usize>> {
+    dirty.sort_unstable();
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for slot in dirty.drain(..).map(usize::from) {
+        match runs.last_mut() {
+            Some(run) if slot <= run.end + gap => run.end = slot + 1,
+            _ => runs.push(slot..slot + 1),
+        }
+    }
+    runs
+}
+
 fn read_only_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -463,11 +599,14 @@ fn read_only_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// COPY_SRC lets tests read the table back.
 fn create_table_buffer(device: &wgpu::Device, entries: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("terrain chunk table"),
-        size: (entries * size_of::<ChunkEntry>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        size: (entries * ENTRY_BYTES) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }
@@ -563,272 +702,4 @@ fn build_pipeline(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cull::Counters;
-    use crate::{PlanetView, SunLight};
-    use vx_core::{Projection, VertexAttributes};
-
-    /// A device without a surface, or `None` when the machine has no adapter (CI).
-    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            ..Default::default()
-        }))
-        .ok()?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("vx_render test device"),
-            ..Default::default()
-        }))
-        .ok()?;
-        Some((device, queue))
-    }
-
-    fn quad() -> (Vec<PackedVertex>, Vec<u32>) {
-        let vertex = |x: f32, y: f32| {
-            PackedVertex::pack(&VertexAttributes {
-                position_voxels: Vec3::new(x, y, 16.0),
-                normal: Vec3::Z,
-                materials: [(2, 15), (0, 0), (0, 0), (0, 0)],
-            })
-        };
-        (
-            vec![
-                vertex(0.0, 0.0),
-                vertex(32.0, 0.0),
-                vertex(32.0, 32.0),
-                vertex(0.0, 32.0),
-            ],
-            vec![0, 1, 2, 0, 2, 3],
-        )
-    }
-
-    fn read_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Vec<u8> {
-        buffer.map_async(wgpu::MapMode::Read, .., |_| {});
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU wait");
-        let bytes = buffer.get_mapped_range(..).expect("mapped").to_vec();
-        buffer.unmap();
-        bytes
-    }
-
-    fn upload(
-        pass: &mut TerrainPass,
-        queue: &wgpu::Queue,
-        vertices: &[PackedVertex],
-        indices: &[u32],
-        offset_m: Vec3,
-    ) -> Result<MeshHandle, PoolError> {
-        pass.upload_mesh(
-            queue,
-            &MeshUpload {
-                vertices,
-                indices,
-                regular_index_count: indices.len() as u32,
-                transition_index_counts: [0; 6],
-            },
-            ChunkPlacement {
-                offset_m,
-                texture_phase_m: Vec3::ZERO,
-                voxel_size_m: 1.0,
-                transition_mask: 0,
-                visible: true,
-            },
-        )
-    }
-
-    fn frame_input(view_proj: Mat4) -> FrameInput<'static> {
-        FrameInput {
-            view_proj,
-            camera_offset_m: Vec3::ZERO,
-            planet: PlanetView::default(),
-            sun: SunLight::default(),
-            moon: None,
-            exposure_ev: 0.0,
-            egui: None,
-        }
-    }
-
-    const TEST_POOLS: TerrainPoolConfig = TerrainPoolConfig {
-        vertex_bytes: 1 << 16,
-        index_bytes: 1 << 16,
-    };
-
-    #[test]
-    fn cull_and_compact_on_the_gpu() {
-        let Some((device, queue)) = headless_device() else {
-            eprintln!("no GPU adapter available, skipping cull_and_compact_on_the_gpu");
-            return;
-        };
-        let mut pass = TerrainPass::new(&device, &queue, TEST_POOLS);
-        let (vertices, indices) = quad();
-        // Uploaded first so its vertex base is 0, which makes the rebase of the visible mesh
-        // observable (vertex base 4). The seen chunk spans z from -40 to -8 in front of the
-        // camera; the hidden one spans z from 20 to 52 behind it.
-        let hidden = upload(
-            &mut pass,
-            &queue,
-            &vertices,
-            &indices,
-            Vec3::new(-16.0, -16.0, 20.0),
-        )
-        .unwrap();
-        let seen = upload(
-            &mut pass,
-            &queue,
-            &vertices,
-            &indices,
-            Vec3::new(-16.0, -16.0, -40.0),
-        )
-        .unwrap();
-        assert_eq!((hidden, seen), (MeshHandle(0), MeshHandle(1)));
-
-        let view_proj = Projection::reverse_z_infinite(std::f32::consts::FRAC_PI_3, 1.0, 0.05);
-        let frame = frame_input(view_proj);
-        pass.prepare_frame(&device, &queue, &frame);
-        assert_eq!(pass.slot_count_this_frame, 2);
-
-        let compacted_copy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test compacted copy"),
-            size: 64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let counters_copy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test counters copy"),
-            size: size_of::<Counters>() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test"),
-        });
-        pass.encode_cull(&mut encoder);
-        encoder.copy_buffer_to_buffer(pass.cull_pass().compacted(), 0, &compacted_copy, 0, 64);
-        encoder.copy_buffer_to_buffer(
-            pass.cull_pass().counters(),
-            0,
-            &counters_copy,
-            0,
-            size_of::<Counters>() as u64,
-        );
-        pass.encode_readback(&mut encoder);
-        queue.submit([encoder.finish()]);
-        pass.after_submit();
-
-        let counters: Counters = *bytemuck::from_bytes(&read_buffer(&device, &counters_copy));
-        assert_eq!(counters.index_count, 6, "{counters:?}");
-        assert_eq!(counters.group_count_x, 1, "one visible chunk");
-        assert_eq!((counters.instance_count, counters.group_count_y), (1, 1));
-        let compacted: Vec<u32> =
-            bytemuck::cast_slice(&read_buffer(&device, &compacted_copy)).to_vec();
-        assert_eq!(
-            &compacted[..6],
-            &[4, 5, 6, 4, 6, 7],
-            "indices rebased by vertex base 4"
-        );
-
-        pass.poll_readback(&device);
-        let stats = pass.cull_stats().expect("readback mapped after the wait");
-        assert_eq!(stats.visible_chunks, 1);
-        assert_eq!(stats.triangles, 2);
-        assert_eq!(stats.frames_old, 0);
-
-        // A freed handle is never drawn.
-        pass.free_mesh(seen);
-        pass.prepare_frame(&device, &queue, &frame);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("test 2"),
-        });
-        pass.encode_cull(&mut encoder);
-        encoder.copy_buffer_to_buffer(
-            pass.cull_pass().counters(),
-            0,
-            &counters_copy,
-            0,
-            size_of::<Counters>() as u64,
-        );
-        queue.submit([encoder.finish()]);
-        let counters: Counters = *bytemuck::from_bytes(&read_buffer(&device, &counters_copy));
-        assert_eq!((counters.index_count, counters.group_count_x), (0, 0));
-        assert_eq!(pass.pool_stats().meshes, 1);
-    }
-
-    #[test]
-    fn upload_fails_without_partial_state() {
-        let Some((device, queue)) = headless_device() else {
-            eprintln!("no GPU adapter available, skipping upload_fails_without_partial_state");
-            return;
-        };
-        let mut pass = TerrainPass::new(
-            &device,
-            &queue,
-            TerrainPoolConfig {
-                vertex_bytes: 4 * VERTEX_BYTES * 4,
-                index_bytes: 8 * INDEX_BYTES,
-            },
-        );
-        let (vertices, indices) = quad();
-        assert!(matches!(
-            upload(&mut pass, &queue, &[], &indices, Vec3::ZERO),
-            Err(PoolError::EmptyMesh)
-        ));
-        let first = upload(&mut pass, &queue, &vertices, &indices, Vec3::ZERO).unwrap();
-        let before = pass.pool_stats();
-        let err = upload(&mut pass, &queue, &vertices, &indices, Vec3::ZERO).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                PoolError::IndexPoolFull {
-                    needed: 24,
-                    largest_free: 8
-                }
-            ),
-            "{err}"
-        );
-        assert_eq!(
-            pass.pool_stats(),
-            before,
-            "a failed upload leaves no partial state"
-        );
-        assert_eq!(
-            pass.slots.len(),
-            2,
-            "the slot taken for the failed upload is free again"
-        );
-        assert_eq!(pass.free_slots.peek(), Some(&Reverse(1)));
-
-        pass.free_mesh(first);
-        let stats = pass.pool_stats();
-        assert_eq!(
-            (
-                stats.meshes,
-                stats.vertex_bytes_used,
-                stats.index_bytes_used
-            ),
-            (0, 0, 0)
-        );
-        assert_eq!(stats.largest_free_vertex_bytes, stats.vertex_bytes_capacity);
-        pass.free_mesh(first);
-        assert_eq!(
-            pass.pool_stats().meshes,
-            0,
-            "a double free is a warning, not a panic"
-        );
-        let again = upload(&mut pass, &queue, &vertices, &indices, Vec3::ZERO).unwrap();
-        assert_eq!(again, MeshHandle(0), "the lowest free slot is reused");
-    }
-
-    #[test]
-    fn frame_uniform_carries_the_scale_parameters() {
-        let u = FrameUniform::new(Mat4::IDENTITY, Vec3::new(0.0, 2.0, 0.0), 0.3, 0.5, 7);
-        assert_eq!(u.params, [0.5, 16.0, MATERIAL_TILE_M as f32, 0.0]);
-        assert_eq!(u.sun_dir, [0.0, 1.0, 0.0, 0.3]);
-        assert_eq!(u.slot_count, 7);
-        assert_eq!(u.planes[5], [0.0, 0.0, 0.0, 1.0]);
-    }
-}
+mod tests;
