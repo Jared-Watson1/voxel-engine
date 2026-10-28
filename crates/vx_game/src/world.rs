@@ -163,7 +163,14 @@ impl World {
             &planet,
             config.voxel_size_m,
         ));
-        let lod = LodTree::new(LodParams::new(&config, sampler.shell_m()));
+        // The union of the per level shells is tighter than `shell_m`, which covers every level
+        // the configuration range allows.
+        let shell = (0..config.lod_levels as u8)
+            .map(|level| sampler.shell_at_m(level))
+            .fold((f64::INFINITY, 0.0f64), |(lo, hi), (a, b)| {
+                (lo.min(a), hi.max(b))
+            });
+        let lod = LodTree::new(LodParams::new(&config, shell));
         let (tx, rx) = channel();
         Self {
             config,
