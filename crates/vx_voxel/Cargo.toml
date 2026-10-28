@@ -9,7 +9,7 @@ publish.workspace = true
 glam.workspace = true
 profiling.workspace = true
 thiserror.workspace = true
-transvoxel.workspace = true
+transvoxel-data.workspace = true
 vx_core.workspace = true
 
 [lints]
