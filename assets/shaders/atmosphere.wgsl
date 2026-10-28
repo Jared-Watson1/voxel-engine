@@ -43,7 +43,7 @@ struct View {
     moon: vec4<f32>,
     // rgb: night sky radiance floor. w: moon albedo.
     night: vec4<f32>,
-    // x, y: render target size in pixels. z: sky ambient scale. w: unused.
+    // x, y: render target size in pixels. z: sky ambient scale. w: angular size of a froxel.
     params: vec4<f32>,
 };
 
@@ -55,8 +55,13 @@ const AERIAL_SIZE: f32 = 32.0;
 // Midpoint quadrature in a quadratic parameter (dense near the start of the ray), so the thin Mie
 // layer at the ground is resolved. Mirrored by `cpu::optical_depth_to_top` in atmosphere.rs.
 const TRANSMITTANCE_STEPS: u32 = 128u;
-const MULTI_SCATTERING_STEPS: f32 = 32.0;
-const SKY_VIEW_STEPS: f32 = 32.0;
+const MULTI_SCATTERING_STEPS: f32 = 20.0;
+// Sky view steps grow with the ray's length through the atmosphere (the reference's variable
+// sample count): the fewest for a short zenith ray, the most for the longest chord.
+const SKY_VIEW_MIN_STEPS: f32 = 12.0;
+const SKY_VIEW_MAX_STEPS: f32 = 32.0;
+// Steps per aerial perspective slice; each column is one march written slice by slice.
+const AERIAL_SUBSTEPS: u32 = 4u;
 // Where in each march segment the medium is sampled (the reference implementation's 0.3).
 const SEGMENT_SAMPLE: f32 = 0.3;
 
@@ -231,6 +236,40 @@ struct ScatteringResult {
     multi_scat_as_1: vec3<f32>,
 };
 
+// One march segment of length `dt` sampled at `p` (relative to the planet centre): the
+// in-scattered radiance integrated analytically over the segment (equation 11 of the reference
+// code), the same for a unit source (f_ms), and the segment's transmittance.
+fn scatter_segment(
+    p: vec3<f32>,
+    dt: f32,
+    sun: vec3<f32>,
+    phase_r: f32,
+    phase_m: f32,
+    uniform_phase: bool,
+    with_multi_scattering: bool,
+) -> ScatteringResult {
+    let r = length(p);
+    let medium = sample_medium(r);
+    let sample_transmittance = exp(-medium.extinction * dt);
+    let mu_sun = dot(sun, p / r);
+    let sun_transmittance = transmittance_to_top(r, mu_sun) * planet_shadow(r, mu_sun);
+    var phase_scattering = medium.scattering / (4.0 * PI);
+    if !uniform_phase {
+        phase_scattering = medium.rayleigh * phase_r + medium.mie * phase_m;
+    }
+    var ms = vec3<f32>(0.0);
+    if with_multi_scattering {
+        ms = multi_scattering(r, mu_sun) * medium.scattering;
+    }
+    let s = sun_transmittance * phase_scattering + ms;
+    let ext = max(medium.extinction, vec3<f32>(1.0e-12));
+    var segment: ScatteringResult;
+    segment.luminance = (s - s * sample_transmittance) / ext;
+    segment.multi_scat_as_1 = (medium.scattering - medium.scattering * sample_transmittance) / ext;
+    segment.transmittance = sample_transmittance;
+    return segment;
+}
+
 // Single scattering along a ray plus the multiple scattering term (equations 1 to 11). `origin`
 // is relative to the planet centre and inside the atmosphere. The march ends at the ground, the
 // top or `t_limit`. Quadratic steps are dense near the origin, where a ray starting at the
@@ -252,7 +291,12 @@ fn integrate_scattering(
     result.multi_scat_as_1 = vec3<f32>(0.0);
 
     let t_bottom = ray_sphere_nearest(origin, dir, bottom_radius());
-    let t_top = ray_sphere_nearest(origin, dir, top_radius());
+    var t_top = ray_sphere_nearest(origin, dir, top_radius());
+    // An origin moved onto the top sphere has a near intersection at zero up to rounding; the
+    // march always runs to the far one, where the ray leaves the atmosphere.
+    if length(origin) >= top_radius() - ground_offset() {
+        t_top = ray_sphere(origin, dir, top_radius()).y;
+    }
     var t_max = 0.0;
     if t_bottom < 0.0 {
         if t_top < 0.0 {
@@ -273,7 +317,6 @@ fn integrate_scattering(
     let cos_theta = dot(sun, dir);
     let phase_r = rayleigh_phase(cos_theta);
     let phase_m = mie_phase(cos_theta);
-    let uniform = 1.0 / (4.0 * PI);
 
     var throughput = vec3<f32>(1.0);
     let n = max(steps, 1.0);
@@ -288,30 +331,11 @@ fn integrate_scattering(
         t0 *= t_max;
         t1 *= t_max;
         let dt = t1 - t0;
-        let t = t0 + dt * SEGMENT_SAMPLE;
-        let p = origin + t * dir;
-        let r = length(p);
-        let medium = sample_medium(r);
-        let sample_transmittance = exp(-medium.extinction * dt);
-
-        let mu_sun = dot(sun, p / r);
-        let sun_transmittance = transmittance_to_top(r, mu_sun) * planet_shadow(r, mu_sun);
-        var phase_scattering = medium.scattering * uniform;
-        if !uniform_phase {
-            phase_scattering = medium.rayleigh * phase_r + medium.mie * phase_m;
-        }
-        var ms = vec3<f32>(0.0);
-        if with_multi_scattering {
-            ms = multi_scattering(r, mu_sun) * medium.scattering;
-        }
-        let s = sun_transmittance * phase_scattering + ms;
-        // Analytic integral of the source over the segment (equation 11 of the reference code).
-        let ext = max(medium.extinction, vec3<f32>(1.0e-12));
-        let s_int = (s - s * sample_transmittance) / ext;
-        result.luminance += throughput * s_int;
-        let ms_int = (medium.scattering - medium.scattering * sample_transmittance) / ext;
-        result.multi_scat_as_1 += throughput * ms_int;
-        throughput *= sample_transmittance;
+        let p = origin + (t0 + dt * SEGMENT_SAMPLE) * dir;
+        let segment = scatter_segment(p, dt, sun, phase_r, phase_m, uniform_phase, with_multi_scattering);
+        result.luminance += throughput * segment.luminance;
+        result.multi_scat_as_1 += throughput * segment.multi_scat_as_1;
+        throughput *= segment.transmittance;
     }
 
     if with_ground && hits_ground {
@@ -505,38 +529,68 @@ fn sky_view(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     origin += entry * dir;
+    var length_m = ray_sphere(origin, dir, top_radius()).y;
+    let t_ground = ray_sphere_nearest(origin, dir, bottom_radius());
+    if t_ground > 0.0 {
+        length_m = min(length_m, t_ground);
+    }
+    let steps = mix(SKY_VIEW_MIN_STEPS, SKY_VIEW_MAX_STEPS, clamp(length_m / atmosphere.radii.w, 0.0, 1.0));
     // From outside the atmosphere the densest air is mid ray, so the steps are uniform.
-    let result = integrate_scattering(origin, dir, sun, 1.0e30, SKY_VIEW_STEPS, entry == 0.0, false, true, false);
+    let result = integrate_scattering(origin, dir, sun, 1.0e30, floor(steps), entry == 0.0, false, true, false);
     textureStore(sky_view_out, id.xy, vec4<f32>(result.luminance, 1.0));
 }
 
 // Froxels over the view frustum (section 5.4): x and y follow the screen (y down), slice w covers
-// distance w^2 * range along each pixel's ray. rgb: in-scattered radiance per unit sun
-// illuminance. a: 1 - mean transmittance. Unused (zero) when the camera is above the atmosphere,
-// where the lighting pass marches per pixel instead.
+// distance w^2 * range along each pixel's ray from where the ray enters the atmosphere (the camera
+// itself when inside). rgb: in-scattered radiance per unit sun illuminance. a: 1 - mean
+// transmittance. One invocation marches a whole column and writes each slice as it passes it
+// (as Bevy's aerial view LUT does), so the column costs 32 slices of steps rather than the sum of
+// 32 separate marches. Slices beyond the ground keep the value at the ground, as the reference
+// moves such froxels onto it.
 @compute @workgroup_size(8, 8, 1)
 fn aerial_perspective(@builtin(global_invocation_id) id: vec3<u32>) {
     let size = u32(AERIAL_SIZE);
-    if id.x >= size || id.y >= size || id.z >= size {
+    if id.x >= size || id.y >= size {
         return;
     }
     let camera = lift_above_ground(frame.camera.xyz);
-    if length(camera) >= top_radius() {
-        textureStore(aerial_out, id, vec4<f32>(0.0));
-        return;
-    }
     let uv = (vec2<f32>(id.xy) + 0.5) / AERIAL_SIZE;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let dir = normalize(unproject(ndc, 1.0));
-    var t = aerial_slice_distance((f32(id.z) + 0.5) / AERIAL_SIZE);
-    // A froxel under the ground sphere is moved onto it, as in the reference implementation.
-    let p = camera + t * dir;
-    let floor_r = bottom_radius() + ground_offset();
-    if length(p) < floor_r {
-        t = length(normalize(p) * floor_r - camera);
+    let entry = distance_to_atmosphere(camera, dir);
+    if entry < 0.0 {
+        for (var z = 0u; z < size; z++) {
+            textureStore(aerial_out, vec3<u32>(id.xy, z), vec4<f32>(0.0));
+        }
+        return;
     }
-    let steps = max(1.0, f32(id.z + 1u) * 2.0);
-    let result = integrate_scattering(camera, dir, frame.sun_direction.xyz, t, steps, false, false, true, false);
-    let mean_transmittance = dot(result.transmittance, vec3<f32>(1.0 / 3.0));
-    textureStore(aerial_out, id, vec4<f32>(result.luminance, 1.0 - mean_transmittance));
+    let origin = camera + entry * dir;
+    let sun = frame.sun_direction.xyz;
+    var t_end = ray_sphere(origin, dir, top_radius()).y;
+    let t_ground = ray_sphere_nearest(origin, dir, bottom_radius());
+    if t_ground > 0.0 {
+        t_end = min(t_end, t_ground);
+    }
+    t_end = max(t_end, 0.0);
+    let cos_theta = dot(sun, dir);
+    let phase_r = rayleigh_phase(cos_theta);
+    let phase_m = mie_phase(cos_theta);
+    var luminance = vec3<f32>(0.0);
+    var throughput = vec3<f32>(1.0);
+    var t = 0.0;
+    for (var z = 0u; z < size; z++) {
+        let t_slice = min(aerial_slice_distance((f32(z) + 0.5) / AERIAL_SIZE), t_end);
+        let dt = (t_slice - t) / f32(AERIAL_SUBSTEPS);
+        if dt > 0.0 {
+            for (var k = 0u; k < AERIAL_SUBSTEPS; k++) {
+                let p = origin + (t + (f32(k) + SEGMENT_SAMPLE) * dt) * dir;
+                let segment = scatter_segment(p, dt, sun, phase_r, phase_m, false, true);
+                luminance += throughput * segment.luminance;
+                throughput *= segment.transmittance;
+            }
+            t = t_slice;
+        }
+        let mean_transmittance = dot(throughput, vec3<f32>(1.0 / 3.0));
+        textureStore(aerial_out, vec3<u32>(id.xy, z), vec4<f32>(luminance, 1.0 - mean_transmittance));
+    }
 }

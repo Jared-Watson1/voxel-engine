@@ -564,7 +564,9 @@ impl Renderer {
         self.terrain.free_mesh(handle);
     }
 
-    /// Sets the planet's atmosphere (D25); the static LUTs are recomputed before the next frame.
+    /// Sets the planet's atmosphere (D25); the static LUTs are recomputed over the next two
+    /// frames. The atmosphere's ground is [`PlanetView::radius_m`] of each frame; a different
+    /// `planet_radius_m` here is logged once and the frame's radius wins.
     pub fn set_atmosphere(&mut self, atmosphere: &AtmosphereParams, planet_radius_m: f64) {
         self.atmosphere.set_params(atmosphere, planet_radius_m);
     }

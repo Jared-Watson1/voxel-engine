@@ -48,10 +48,10 @@ pub(crate) const SKY_AMBIENT_SCALE: f32 = 1.0;
 /// Night floor: radiance of a uniform dim blue sky added to the sky and, as irradiance, to the
 /// terrain, per unit of sun illuminance. Starlight and airglow are about 1e-8 of daylight and
 /// moonlight about 1e-6, invisible at a fixed exposure, so this floor stands in for the adapted
-/// eye (with the bluish cast of scotopic vision) until auto exposure exists: about 1/400 of the
-/// noon sky, so night reads as dark blue rather than black at `exposure_ev` 0. Artistic, not
-/// physical.
-pub(crate) const NIGHT_SKY_RADIANCE: [f32; 3] = [0.000_08, 0.000_14, 0.000_32];
+/// eye (with the bluish cast of scotopic vision) until auto exposure exists. Artistic, not
+/// physical: about a sixth of the noon zenith's blue, the least that survives the toe of the
+/// tonemap as a dark navy sky over near black terrain at `exposure_ev` 0.
+pub(crate) const NIGHT_SKY_RADIANCE: [f32; 3] = [0.0012, 0.0020, 0.0045];
 
 /// Matches `struct Atmosphere` in `assets/shaders/atmosphere.wgsl` (engineering rule 9).
 #[repr(C)]
@@ -92,7 +92,8 @@ pub(crate) struct ViewUniform {
     pub moon: [f32; 4],
     /// rgb: night sky radiance floor. w: moon albedo.
     pub night: [f32; 4],
-    /// x, y: target size in pixels. z: sky ambient scale. w: unused.
+    /// x, y: target size in pixels. z: sky ambient scale. w: angular size of a froxel in
+    /// radians (the larger of its width and height).
     pub params: [f32; 4],
 }
 
@@ -123,9 +124,26 @@ impl ViewUniform {
             sun_illuminance: frame.sun.illuminance.extend(0.0).to_array(),
             moon,
             night: [nr, ng, nb, albedo],
-            params: [width as f32, height as f32, SKY_AMBIENT_SCALE, 0.0],
+            params: [
+                width as f32,
+                height as f32,
+                SKY_AMBIENT_SCALE,
+                froxel_angle_rad(frame.view_proj),
+            ],
         }
     }
+}
+
+/// Angular size of a froxel: the field of view over the froxel count, along the wider axis. The
+/// view is rotation only, so a row of the projection's upper 3 x 3 block keeps its focal scale.
+fn froxel_angle_rad(view_proj: glam::Mat4) -> f32 {
+    let focal = view_proj
+        .row(0)
+        .truncate()
+        .length()
+        .min(view_proj.row(1).truncate().length())
+        .max(1.0e-6);
+    2.0 * (1.0 / focal).atan() / AERIAL_SIZE as f32
 }
 
 /// Per metre coefficients and radii derived from [`AtmosphereParams`] and the planet radius, in
@@ -167,8 +185,9 @@ impl Coefficients {
     }
 
     /// Longest segment inside the atmosphere that misses the ground: the chord through the top
-    /// sphere tangent to the ground. From inside the atmosphere every visible ground point is
-    /// closer, so the froxels cover the terrain and the per pixel march serves views from above.
+    /// sphere tangent to the ground. Every visible ground point is closer than this to the camera
+    /// (inside the atmosphere) or to where the view ray enters it (outside), so the froxels,
+    /// whose slices start at that entry, cover all terrain but valleys below the mean radius.
     pub(crate) fn aerial_range_m(&self) -> f64 {
         2.0 * ((self.top_m - self.bottom_m) * (self.top_m + self.bottom_m)).sqrt()
     }
@@ -305,6 +324,16 @@ struct Luts {
     aerial: Lut,
 }
 
+/// The static LUTs are recomputed over two frames, transmittance then multiple scattering (which
+/// reads it), so a parameter change never puts both passes in one frame's sky budget. The frame
+/// between lights with the new transmittance and the previous multiple scattering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaticLuts {
+    Current,
+    MultiScattering,
+    Both,
+}
+
 struct LutPipelines {
     transmittance: wgpu::ComputePipeline,
     multi_scattering: wgpu::ComputePipeline,
@@ -333,8 +362,8 @@ pub(crate) struct AtmospherePass {
     /// Set by [`AtmospherePass::set_params`]; a frame whose planet radius differs is then logged.
     explicit_radius: bool,
     warned_radius: bool,
-    /// The static LUTs (transmittance, multiple scattering, irradiance) need recomputing.
-    dirty: bool,
+    /// Static LUTs still to recompute after a parameter change.
+    dirty: StaticLuts,
     atmosphere_uniform: wgpu::Buffer,
     view_uniform: wgpu::Buffer,
     luts: Luts,
@@ -662,7 +691,7 @@ impl AtmospherePass {
             radius_m: 10_000.0,
             explicit_radius: false,
             warned_radius: false,
-            dirty: true,
+            dirty: StaticLuts::Both,
             atmosphere_uniform,
             view_uniform,
             luts,
@@ -695,7 +724,7 @@ impl AtmospherePass {
         self.radius_m = planet_radius_m;
         self.explicit_radius = true;
         self.warned_radius = false;
-        self.dirty = true;
+        self.dirty = StaticLuts::Both;
     }
 
     pub(crate) fn coefficients(&self) -> Coefficients {
@@ -724,9 +753,9 @@ impl AtmospherePass {
                 self.warned_radius = true;
             }
             self.radius_m = frame_radius_m;
-            self.dirty = true;
+            self.dirty = StaticLuts::Both;
         }
-        if self.dirty {
+        if self.dirty == StaticLuts::Both {
             let uniform = self.coefficients().uniform();
             queue.write_buffer(&self.atmosphere_uniform, 0, bytemuck::bytes_of(&uniform));
         }
@@ -734,12 +763,12 @@ impl AtmospherePass {
         queue.write_buffer(&self.view_uniform, 0, bytemuck::bytes_of(&view));
     }
 
-    /// Encodes the LUT passes this frame needs: transmittance and multiple scattering after a
-    /// parameter change, sky view and aerial perspective always.
+    /// Encodes the LUT passes this frame needs: transmittance or multiple scattering in the two
+    /// frames after a parameter change, sky view and aerial perspective always.
     pub(crate) fn encode_luts(&mut self, encoder: &mut wgpu::CommandEncoder, timer: &mut GpuTimer) {
         profiling::scope!("atmosphere luts");
         let groups = |size: u32, workgroup: u32| size.div_ceil(workgroup);
-        if self.dirty {
+        if self.dirty == StaticLuts::Both {
             let [tw, th] = TRANSMITTANCE_SIZE;
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("transmittance lut"),
@@ -750,7 +779,8 @@ impl AtmospherePass {
             pass.set_bind_group(1, &self.out_transmittance, &[]);
             pass.dispatch_workgroups(groups(tw, 8), groups(th, 8), 1);
             drop(pass);
-
+            self.dirty = StaticLuts::MultiScattering;
+        } else if self.dirty == StaticLuts::MultiScattering {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("multiple scattering lut"),
                 timestamp_writes: timer.compute_writes("multiple scattering lut"),
@@ -760,7 +790,7 @@ impl AtmospherePass {
             pass.set_bind_group(1, &self.out_multi_scattering, &[]);
             pass.dispatch_workgroups(MULTI_SCATTERING_SIZE, MULTI_SCATTERING_SIZE, 1);
             drop(pass);
-            self.dirty = false;
+            self.dirty = StaticLuts::Current;
         }
 
         let [sw, sh] = SKY_VIEW_SIZE;
@@ -781,7 +811,7 @@ impl AtmospherePass {
         pass.set_pipeline(&self.pipelines.aerial);
         pass.set_bind_group(0, &self.shared_full, &[]);
         pass.set_bind_group(1, &self.out_aerial, &[]);
-        pass.dispatch_workgroups(groups(AERIAL_SIZE, 8), groups(AERIAL_SIZE, 8), AERIAL_SIZE);
+        pass.dispatch_workgroups(groups(AERIAL_SIZE, 8), groups(AERIAL_SIZE, 8), 1);
     }
 
     pub(crate) fn encode_lighting(
@@ -852,7 +882,7 @@ impl AtmospherePass {
         self.pipelines = pipelines;
         self.lighting = lighting;
         self.atmosphere_source = source.to_owned();
-        self.dirty = true;
+        self.dirty = StaticLuts::Both;
         Ok(())
     }
 
@@ -1137,10 +1167,13 @@ pub(crate) mod tests {
         frame: &FrameInput,
     ) {
         let mut timer = GpuTimer::new(device, queue);
-        pass.prepare_frame(queue, frame, 64, 64);
-        let mut encoder = device.create_command_encoder(&Default::default());
-        pass.encode_luts(&mut encoder, &mut timer);
-        queue.submit([encoder.finish()]);
+        // Two frames, so static LUTs pending after a parameter change are both done.
+        for _ in 0..2 {
+            pass.prepare_frame(queue, frame, 64, 64);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            pass.encode_luts(&mut encoder, &mut timer);
+            queue.submit([encoder.finish()]);
+        }
     }
 
     /// Row of the sky view LUT whose texel centre is the last one above the horizon.
@@ -1296,7 +1329,8 @@ struct Scene {
     view_proj: mat4x4<f32>,
     // xyz: planet centre relative to the camera. w: radius.
     planet: vec4<f32>,
-    // x, y: size. z: mode (0 sphere, 1 constant distance, 2 sky). w: distance for mode 1.
+    // x, y: size. z: mode (0 sphere, 1 constant distance, 2 sky, 3 plain sphere). w: distance
+    // for mode 1.
     params: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> scene: Scene;
@@ -1331,10 +1365,11 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
     out.normal = vec4<f32>(0.0);
     out.depth = 0.0;
     let grass = vec3<f32>(0.12, 0.25, 0.03);
-    if scene.params.z > 1.5 {
+    let mode = u32(scene.params.z + 0.5);
+    if mode == 2u {
         return out;
     }
-    if scene.params.z > 0.5 {
+    if mode == 1u {
         let p = dir * scene.params.w;
         out.albedo = vec4<f32>(grass, 1.0);
         out.normal = vec4<f32>(up, 0.0);
@@ -1359,10 +1394,14 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
     let n0 = normalize(local);
     let q = local / 120.0;
     let bump = vec3<f32>(cos(q.x * 1.7 + sin(q.z)), cos(q.y * 1.3 + sin(q.x * 0.7)), cos(q.z * 1.1 + sin(q.y))) * 0.6;
-    let n = normalize(n0 + bump - n0 * dot(bump, n0));
+    var n = normalize(n0 + bump - n0 * dot(bump, n0));
     var albedo = grass;
     if dot(n, n0) < 0.8 {
         albedo = vec3<f32>(0.42, 0.40, 0.34);
+    }
+    if mode == 3u {
+        n = n0;
+        albedo = grass;
     }
     out.albedo = vec4<f32>(albedo, 1.0);
     out.normal = vec4<f32>(n, 0.0);
@@ -1383,6 +1422,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
     #[derive(Debug, Clone, Copy)]
     pub(crate) enum Surface {
         Sphere,
+        PlainSphere,
         Distance(f32),
         Sky,
     }
@@ -1513,6 +1553,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
         ) -> Option<GpuTimings> {
             let (mode, distance) = match surface {
                 Surface::Sphere => (0.0, 0.0),
+                Surface::PlainSphere => (3.0, 0.0),
                 Surface::Distance(d) => (1.0, d),
                 Surface::Sky => (2.0, 0.0),
             };
@@ -1683,18 +1724,26 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
         );
     }
 
-    /// Medians of each pass over `frames` frames after a warm up.
+    struct Measurement {
+        /// Median of each pass over the frames it ran in.
+        passes: Vec<(&'static str, f64)>,
+        /// Median and largest per frame sky and lighting time.
+        sky_median_ms: f64,
+        sky_max_ms: f64,
+    }
+
     fn measure(
         h: &mut Harness,
         frame: &FrameInput,
         surface: Surface,
         frames: usize,
         static_luts: bool,
-    ) -> Vec<(&'static str, f64)> {
+    ) -> Measurement {
         let mut samples: Vec<(&'static str, Vec<f64>)> = Vec::new();
+        let mut sky = Vec::new();
         for i in 0..frames + 5 {
-            if static_luts {
-                h.atmosphere.dirty = true;
+            if static_luts && h.atmosphere.dirty == StaticLuts::Current {
+                h.atmosphere.dirty = StaticLuts::Both;
             }
             let Some(timings) = h.render(frame, surface) else {
                 continue;
@@ -1702,6 +1751,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
             if i < 5 {
                 continue;
             }
+            sky.push(timings.sky_and_lighting_ms());
             for (name, ms) in timings.passes {
                 match samples.iter_mut().find(|(n, _)| *n == name) {
                     Some((_, v)) => v.push(ms),
@@ -1709,13 +1759,18 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
                 }
             }
         }
-        samples
-            .into_iter()
-            .map(|(name, mut v)| {
-                v.sort_by(f64::total_cmp);
-                (name, v[v.len() / 2])
-            })
-            .collect()
+        sky.sort_by(f64::total_cmp);
+        Measurement {
+            passes: samples
+                .into_iter()
+                .map(|(name, mut v)| {
+                    v.sort_by(f64::total_cmp);
+                    (name, v[v.len() / 2])
+                })
+                .collect(),
+            sky_median_ms: sky.get(sky.len() / 2).copied().unwrap_or(f64::NAN),
+            sky_max_ms: sky.last().copied().unwrap_or(f64::NAN),
+        }
     }
 
     #[test]
@@ -1738,7 +1793,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
                 false,
             ),
             (
-                "ground, static LUTs every frame",
+                "ground, static LUTs alternating every frame",
                 ground_view(w, hh, 50.0, level),
                 Surface::Sphere,
                 true,
@@ -1769,6 +1824,32 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
                 false,
             ),
             (
+                "30 km, froxels with a per pixel rim",
+                frame_input(
+                    10_000.0,
+                    30_000.0,
+                    Vec3::new(1.0, 1.0, 0.0),
+                    Vec3::new(0.0, -1.0, 0.05),
+                    w,
+                    hh,
+                ),
+                Surface::Sphere,
+                false,
+            ),
+            (
+                "69 km, LUT to march crossfade (atmosphere radius 8 deg)",
+                frame_input(
+                    10_000.0,
+                    69_000.0,
+                    Vec3::new(1.0, 1.0, 0.0),
+                    Vec3::new(0.0, -1.0, 0.05),
+                    w,
+                    hh,
+                ),
+                Surface::Sphere,
+                false,
+            ),
+            (
                 "100 km orbit, planet and limb",
                 frame_input(
                     10_000.0,
@@ -1783,33 +1864,76 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
             ),
         ];
         let mut worst: f64 = 0.0;
-        eprintln!("GPU pass medians at {w}x{hh}, 10 km planet, default atmosphere:");
+        eprintln!(
+            "GPU pass medians at {w}x{hh}, 10 km planet, default atmosphere \
+             (render passes exclusive, compute passes raw):"
+        );
         for (name, frame, surface, static_luts) in &scenes {
-            let passes = measure(&mut h, frame, *surface, 30, *static_luts);
-            assert!(!passes.is_empty(), "timings for {name}");
-            let timings = GpuTimings {
-                passes: passes.clone(),
-                frames_old: 0,
-            };
-            let sky = timings.sky_and_lighting_ms();
-            worst = worst.max(sky);
-            let list: Vec<String> = passes
+            let m = measure(&mut h, frame, *surface, 30, *static_luts);
+            assert!(!m.passes.is_empty(), "timings for {name}");
+            assert!(
+                GpuTimings::SKY_AND_LIGHTING_PASSES
+                    .iter()
+                    .skip(2)
+                    .all(|p| m.passes.iter().any(|(n, _)| n == p)),
+                "every per frame sky pass is timed: {:?}",
+                m.passes
+            );
+            worst = worst.max(m.sky_median_ms);
+            let list: Vec<String> = m
+                .passes
                 .iter()
                 .map(|(n, ms)| format!("{n} {ms:.3}"))
                 .collect();
             eprintln!(
-                "  {name}: {}; sky and lighting {sky:.3} ms",
-                list.join(", ")
+                "  {name}: {}; sky and lighting per frame median {:.3} ms, max {:.3} ms",
+                list.join(", "),
+                m.sky_median_ms,
+                m.sky_max_ms
             );
         }
         eprintln!(
-            "worst sky and lighting {worst:.3} ms against the {} ms budget{}",
+            "worst median sky and lighting {worst:.3} ms against the {} ms budget{}",
             Budgets::SKY_AND_LIGHTING_MS,
             if worst > Budgets::SKY_AND_LIGHTING_MS {
                 " (OVER)"
             } else {
                 ""
             }
+        );
+    }
+
+    #[test]
+    fn broken_shaders_keep_the_previous_pipelines() {
+        let Some(mut h) = Harness::new(64, 64) else {
+            eprintln!(
+                "no GPU adapter available, skipping broken_shaders_keep_the_previous_pipelines"
+            );
+            return;
+        };
+        assert!(h.atmosphere.reload_luts(&h.device, "fn broken(").is_err());
+        let missing_entry = ATMOSPHERE_WGSL.replace("fn sky_view(", "fn sky_view_renamed(");
+        assert!(h.atmosphere.reload_luts(&h.device, &missing_entry).is_err());
+        assert!(
+            h.atmosphere
+                .reload_lighting(&h.device, "@fragment fn fs_main() -> nope {}")
+                .is_err()
+        );
+        assert!(h.post.reload(&h.device, "garbage").is_err());
+        assert!(h.atmosphere.reload_luts(&h.device, ATMOSPHERE_WGSL).is_ok());
+        assert!(
+            h.atmosphere
+                .reload_lighting(&h.device, LIGHTING_WGSL)
+                .is_ok()
+        );
+        assert!(h.post.reload(&h.device, crate::post::TONEMAP_WGSL).is_ok());
+        let frame = ground_view(h.width, h.height, 40.0, Vec3::new(1.0, 0.3, 0.0));
+        h.render(&frame, Surface::Sphere);
+        let display = h.read_display();
+        let sky = &display[..3];
+        assert!(
+            sky[2] > sky[0],
+            "the frame after failed reloads still renders: {sky:?}"
         );
     }
 
@@ -1836,66 +1960,78 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> GBuffer {
         night.moon = Some(moon);
         let mut dusk_moon = ground_view(w, hh, 4.0, Vec3::new(1.0, 0.25, 0.4));
         dusk_moon.moon = Some(moon);
+        let ground = |sun: f32, forward: Vec3| (ground_view(w, hh, sun, forward), Surface::Sphere);
+        let at = |altitude: f32, sun: Vec3, forward: Vec3| {
+            (
+                frame_input(10_000.0, altitude, sun, forward, w, hh),
+                Surface::PlainSphere,
+            )
+        };
+        let sunset = frame_input(
+            10_000.0,
+            30.0,
+            sun_at_elevation(3.0),
+            Vec3::new(1.0, -0.02, 0.15),
+            w,
+            hh,
+        );
         let views = [
-            ("noon", ground_view(w, hh, 60.0, level), Surface::Sphere),
-            (
-                "afternoon",
-                ground_view(w, hh, 25.0, level),
-                Surface::Sphere,
-            ),
-            (
-                "sunset",
-                frame_input(
-                    10_000.0,
-                    30.0,
-                    sun_at_elevation(3.0),
-                    Vec3::new(1.0, -0.02, 0.15),
-                    w,
-                    hh,
-                ),
-                Surface::Sphere,
-            ),
-            ("dusk-moon", dusk_moon, Surface::Sphere),
-            ("night", night, Surface::Sphere),
+            ("noon", ground(60.0, level)),
+            ("afternoon", ground(25.0, level)),
+            ("sunset", (sunset, Surface::Sphere)),
+            ("dusk-moon", (dusk_moon, Surface::Sphere)),
+            ("night", (night, Surface::Sphere)),
             (
                 "high",
-                frame_input(
-                    10_000.0,
-                    600.0,
-                    Vec3::new(0.5, 0.8, 0.3),
-                    Vec3::new(1.0, -0.35, 0.0),
-                    w,
-                    hh,
-                ),
-                Surface::Sphere,
+                at(600.0, Vec3::new(0.5, 0.8, 0.3), Vec3::new(1.0, -0.35, 0.0)),
             ),
             (
                 "orbit-2km",
-                frame_input(
-                    10_000.0,
-                    2_000.0,
+                at(2_000.0, Vec3::new(1.0, 0.6, 0.2), Vec3::new(1.0, -0.6, 0.0)),
+            ),
+            (
+                "orbit-30km",
+                at(
+                    30_000.0,
                     Vec3::new(1.0, 0.6, 0.2),
-                    Vec3::new(1.0, -0.6, 0.0),
-                    w,
-                    hh,
+                    Vec3::new(0.0, -1.0, 0.1),
                 ),
-                Surface::Sphere,
+            ),
+            (
+                "orbit-69km",
+                at(
+                    69_000.0,
+                    Vec3::new(1.0, 0.6, 0.2),
+                    Vec3::new(0.0, -1.0, 0.1),
+                ),
             ),
             (
                 "orbit-100km",
-                frame_input(
-                    10_000.0,
+                at(
                     100_000.0,
                     Vec3::new(1.0, 0.3, 0.4),
                     Vec3::new(0.0, -1.0, 0.0),
-                    w,
-                    hh,
                 ),
-                Surface::Sphere,
             ),
+            ("noon-hazy", ground(60.0, level)),
+            ("afternoon-hazy", ground(25.0, level)),
         ];
-        for (name, frame, surface) in &views {
-            h.render(frame, *surface);
+        let hazy = AtmosphereParams {
+            mie_scattering_optical_depth: 0.04,
+            mie_absorption_optical_depth: 0.004,
+            ..AtmosphereParams::default()
+        };
+        let only = std::env::var("VX_PREVIEW_ONLY").ok();
+        for (name, (frame, surface)) in views {
+            if only.as_deref().is_some_and(|o| !name.contains(o)) {
+                continue;
+            }
+            if name.ends_with("hazy") {
+                h.atmosphere.set_params(&hazy, 10_000.0);
+            }
+            // Two frames, so static LUTs pending after a parameter change are both done.
+            h.render(&frame, surface);
+            h.render(&frame, surface);
             let rgba = h.read_display();
             let mut ppm = format!("P6\n{w} {hh}\n255\n").into_bytes();
             for px in rgba.chunks_exact(4) {

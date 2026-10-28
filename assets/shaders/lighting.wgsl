@@ -3,11 +3,12 @@
 // the units of the sun's illuminance (a white Lambert surface facing a sun of illuminance 1 above
 // the atmosphere has radiance 1 / pi); the tonemap pass applies the exposure.
 //
-// Per pixel: depth 0 (reverse-Z, infinite far plane) is the sky, from the sky view LUT inside the
-// atmosphere and a per pixel march from above it, with the sun disc, the moon and the night floor.
-// Anything else is terrain: the sun through the transmittance at the pixel's altitude and sun
-// angle, sky ambient from the irradiance LUT, ground bounce and the night floor, then aerial
-// perspective from the froxel volume (camera inside the atmosphere) or a per pixel march.
+// Per pixel: depth 0 (reverse-Z, infinite far plane) is the sky from the sky view LUT, with the
+// sun disc, the moon and the night floor. Anything else is terrain: the sun through the
+// transmittance at the pixel's altitude and sun angle, sky ambient from the irradiance LUT, ground
+// bounce and the night floor, then aerial perspective from the froxel volume. A per pixel march
+// replaces the LUTs where they fall short: terrain beyond the froxel range, and from outside the
+// atmosphere a planet small on screen (a sharp limb over few pixels) and the rim of the froxels.
 // Positions are camera relative (D4); the camera's position relative to the planet centre comes
 // from the uniform.
 
@@ -113,6 +114,11 @@ fn sun_disc(sin_angle: f32, aa: f32, facing: bool) -> vec3<f32> {
     return frame.sun_illuminance.rgb * centre * limb * edge;
 }
 
+// From outside the atmosphere the per pixel march serves a small planet disc (a sharp limb, few
+// pixels) and the LUTs a large one, crossfaded between these angular radii of the atmosphere.
+const MARCH_BELOW_RAD: f32 = 0.1047;
+const LUTS_ABOVE_RAD: f32 = 0.1745;
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(in.clip.xy);
@@ -129,70 +135,117 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let camera_raw = frame.camera.xyz;
     let camera = lift_above_ground(camera_raw);
     let camera_r = length(camera);
+    let camera_up = camera / camera_r;
     let inside = camera_r < top_radius();
+    var lut_weight = 1.0;
+    var atmosphere_radius_rad = PI;
+    if !inside {
+        atmosphere_radius_rad = asin(min(top_radius() / camera_r, 1.0));
+        lut_weight = smoothstep(MARCH_BELOW_RAD, LUTS_ABOVE_RAD, atmosphere_radius_rad);
+    }
 
+    // A surface is terrain, or the ground sphere where a ray meets it with no terrain drawn (far
+    // from orbit, or a streaming hole), lit with the ground albedo.
+    var surface = false;
+    var distance = 0.0;
+    var dir = ray;
+    var colour = vec3<f32>(0.0);
     if depth == 0.0 {
         let t_ground = ray_sphere_nearest(camera, ray, bottom_radius());
-        let hits_ground = t_ground >= 0.0;
-        var colour = vec3<f32>(0.0);
-        var view_transmittance = vec3<f32>(1.0);
-        if inside && !hits_ground {
-            colour = sky_view_radiance(camera, ray, false) * e_sun;
-            view_transmittance = transmittance_to_top(camera_r, dot(ray, camera / camera_r));
-        } else {
-            var t_limit = 1.0e30;
-            if hits_ground {
-                t_limit = t_ground;
-            }
-            let march = march_view(camera, ray, t_limit);
-            colour = march.luminance * e_sun;
-            view_transmittance = march.transmittance;
-        }
-        if hits_ground {
-            // No terrain drawn where the ray meets the ground sphere (far from orbit, or a
-            // streaming hole): the sphere is lit with the ground albedo.
+        if t_ground >= 0.0 {
+            surface = true;
+            distance = t_ground;
             let p = camera + t_ground * ray;
-            let ground = surface_radiance(p, normalize(p), atmosphere.ground.rgb);
-            return vec4<f32>(colour + view_transmittance * ground, 1.0);
+            colour = surface_radiance(p, normalize(p), atmosphere.ground.rgb);
         }
-        var behind = vec3<f32>(0.0);
-        var sun_visible = true;
-        if frame.moon.w > 0.0 {
-            let moon_centre = frame.moon.xyz;
-            let t_moon = ray_sphere(-moon_centre, ray, frame.moon.w);
-            if t_moon.x > 0.0 {
-                let n = normalize(t_moon.x * ray - moon_centre);
-                behind += frame.night.w / PI * e_sun * max(dot(n, sun), 0.0);
-                sun_visible = false;
-            }
-        }
-        behind += sun_disc(sin_sun, sun_aa, sun_visible && dot(ray, sun) > 0.0);
-        return vec4<f32>(colour + view_transmittance * behind + frame.night.rgb, 1.0);
-    }
-
-    let pos = unproject(ndc, depth);
-    let distance = length(pos);
-    let dir = pos / max(distance, 1.0e-6);
-    let albedo = textureLoad(albedo_tex, coord, 0).rgb;
-    let normal = normalize(textureLoad(normal_tex, coord, 0).xyz);
-    var colour = surface_radiance(camera_raw + pos, normal, albedo);
-
-    let range = atmosphere.radii.w;
-    if inside && distance < range {
-        let w = sqrt(distance / range);
-        let slice = w * AERIAL_SIZE;
-        // The first half slice fades in from the camera, as in the reference implementation.
-        var weight = 1.0;
-        var w_lookup = w;
-        if slice < 0.5 {
-            weight = clamp(slice * 2.0, 0.0, 1.0);
-            w_lookup = 0.5 / AERIAL_SIZE;
-        }
-        let ap = textureSampleLevel(aerial_lut, lut_sampler, vec3<f32>(uv, w_lookup), 0.0) * weight;
-        colour = colour * (1.0 - ap.a) + ap.rgb * e_sun;
     } else {
-        let march = march_view(camera, dir, distance);
-        colour = colour * march.transmittance + march.luminance * e_sun;
+        let pos = unproject(ndc, depth);
+        surface = true;
+        distance = length(pos);
+        dir = pos / max(distance, 1.0e-6);
+        let albedo = textureLoad(albedo_tex, coord, 0).rgb;
+        let normal = normalize(textureLoad(normal_tex, coord, 0).xyz);
+        colour = surface_radiance(camera_raw + pos, normal, albedo);
     }
-    return vec4<f32>(colour, 1.0);
+
+    let entry_or_miss = distance_to_atmosphere(camera, dir);
+    let entry = max(entry_or_miss, 0.0);
+    var march_weight = 0.0;
+    var lut_luminance = vec3<f32>(0.0);
+    var lut_transmittance = vec3<f32>(1.0);
+    var froxel = vec4<f32>(0.0);
+    if surface {
+        let range = atmosphere.radii.w;
+        let along = distance - entry;
+        var froxel_weight = lut_weight;
+        if !inside {
+            // Near the atmosphere's silhouette a froxel's centre ray can miss the atmosphere
+            // while the pixel's ray does not, so the outer two froxels march per pixel.
+            let from_centre = acos(clamp(dot(dir, -camera_up), -1.0, 1.0));
+            let margin = (atmosphere_radius_rad - from_centre) / max(frame.params.w, 1.0e-4);
+            froxel_weight *= smoothstep(1.0, 2.0, margin);
+        }
+        if along >= range {
+            froxel_weight = 0.0;
+        }
+        march_weight = 1.0 - froxel_weight;
+        if froxel_weight > 0.0 {
+            let w = sqrt(max(along, 0.0) / range);
+            let slice = w * AERIAL_SIZE;
+            // The first half slice fades in from its start, as in the reference implementation.
+            var fade = 1.0;
+            var w_lookup = w;
+            if slice < 0.5 {
+                fade = clamp(slice * 2.0, 0.0, 1.0);
+                w_lookup = 0.5 / AERIAL_SIZE;
+            }
+            froxel = textureSampleLevel(aerial_lut, lut_sampler, vec3<f32>(uv, w_lookup), 0.0) * fade;
+        }
+    } else {
+        march_weight = 1.0 - lut_weight;
+        if lut_weight > 0.0 && entry_or_miss >= 0.0 {
+            lut_luminance = sky_view_radiance(camera, ray, false);
+            let origin = camera + entry * ray;
+            let origin_r = length(origin);
+            lut_transmittance = transmittance_to_top(origin_r, dot(ray, origin / origin_r));
+        }
+    }
+
+    var march: ScatteringResult;
+    march.luminance = vec3<f32>(0.0);
+    march.transmittance = vec3<f32>(1.0);
+    if march_weight > 0.0 {
+        var t_limit = 1.0e30;
+        if surface {
+            t_limit = distance;
+        }
+        march = march_view(camera, dir, t_limit);
+    }
+
+    if surface {
+        let with_froxels = colour * (1.0 - froxel.a) + froxel.rgb * e_sun;
+        let with_march = colour * march.transmittance + march.luminance * e_sun;
+        return vec4<f32>(mix(with_froxels, with_march, march_weight), 1.0);
+    }
+
+    let sky = mix(lut_luminance, march.luminance, march_weight) * e_sun;
+    let view_transmittance = mix(lut_transmittance, march.transmittance, march_weight);
+    var behind = vec3<f32>(0.0);
+    var sun_visible = true;
+    if frame.moon.w > 0.0 {
+        let moon_centre = frame.moon.xyz;
+        let t_moon = ray_sphere(-moon_centre, ray, frame.moon.w);
+        if t_moon.x > 0.0 {
+            let n = normalize(t_moon.x * ray - moon_centre);
+            behind += frame.night.w / PI * e_sun * max(dot(n, sun), 0.0);
+            sun_visible = false;
+        }
+    }
+    behind += sun_disc(sin_sun, sun_aa, sun_visible && dot(ray, sun) > 0.0);
+    // The night floor glows from the air like airglow: full along a column as long as the
+    // zenith column from the ground, none in space.
+    let shell = ray_sphere(camera, ray, top_radius());
+    let path = max(shell.y - max(shell.x, 0.0), 0.0);
+    let glow = clamp(path / (top_radius() - bottom_radius()), 0.0, 1.0);
+    return vec4<f32>(sky + view_transmittance * behind + frame.night.rgb * glow, 1.0);
 }

@@ -3,13 +3,15 @@
 //! Apple GPUs sample timestamps only at pass boundaries (`Features::TIMESTAMP_QUERY` without
 //! `TIMESTAMP_QUERY_INSIDE_ENCODERS` or `_INSIDE_PASSES`), so every timed span starts and ends at
 //! the boundary of a pass. Passes owned by other modules that open their own untimed passes are
-//! timed from the end of an empty marker pass to the start of the next timed pass.
+//! timed from the end of a marker pass to the start of the next timed pass. Metal takes no
+//! sample in an empty pass, so the marker dispatches one invocation of a no-op shader.
 //!
 //! A tile based GPU overlaps consecutive passes: a render pass's first sample is taken when its
-//! vertex stage starts, which can be long before the previous pass's fragments finish. Each pass
-//! is therefore reported as its exclusive time, from the later of its own start and the latest
-//! end of the passes encoded before it, to its end: what the pass adds to the frame. The sum of
-//! the passes is the GPU time from the first timed sample to the last, less idle gaps.
+//! vertex stage starts, which can be long before the previous pass's fragments finish, so a
+//! render pass is reported as its exclusive time, from the later of its own start and the latest
+//! end of the passes encoded before it, to its end. Compute passes have no such early sample and
+//! are reported from their start to their end even when they run concurrently with an earlier
+//! render pass, so their work is never hidden; the sum over passes can then exceed the frame.
 //!
 //! The queries of a frame are resolved and copied into one of a few readback buffers, mapped
 //! after the submission and collected without blocking at the start of a later frame. A frame
@@ -49,10 +51,13 @@ struct Span {
     name: &'static str,
     begin: u32,
     end: u32,
+    /// Render pass: measured from the latest earlier end (see the module documentation).
+    exclusive: bool,
 }
 
 struct Queries {
     set: wgpu::QuerySet,
+    marker: wgpu::ComputePipeline,
     resolve: wgpu::Buffer,
     /// Nanoseconds per timestamp tick.
     period_ns: f64,
@@ -77,6 +82,7 @@ impl GpuTimer {
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY)
             .then(|| Queries {
+                marker: marker_pipeline(device),
                 set: device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("pass timestamps"),
                     ty: wgpu::QueryType::Timestamp,
@@ -153,6 +159,7 @@ impl GpuTimer {
             name,
             begin,
             end: begin + 1,
+            exclusive: false,
         });
         Some(wgpu::ComputePassTimestampWrites {
             query_set: &self.queries.as_ref()?.set,
@@ -171,6 +178,7 @@ impl GpuTimer {
             name,
             begin,
             end: begin + 1,
+            exclusive: true,
         });
         Some(wgpu::RenderPassTimestampWrites {
             query_set: &self.queries.as_ref()?.set,
@@ -179,19 +187,21 @@ impl GpuTimer {
         })
     }
 
-    /// Encodes an empty compute pass whose end is a timestamp, and returns its index. With
+    /// Encodes a minimal compute pass whose end is a timestamp, and returns its index. With
     /// [`GpuTimer::span_to_next`] it times work encoded by code that opens its own passes.
     pub(crate) fn marker(&mut self, encoder: &mut wgpu::CommandEncoder) -> Option<u32> {
         let index = self.alloc(1)?;
-        let set = &self.queries.as_ref()?.set;
-        drop(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        let queries = self.queries.as_ref()?;
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("timestamp marker"),
             timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                query_set: set,
+                query_set: &queries.set,
                 beginning_of_pass_write_index: None,
                 end_of_pass_write_index: Some(index),
             }),
-        }));
+        });
+        pass.set_pipeline(&queries.marker);
+        pass.dispatch_workgroups(1, 1, 1);
         Some(index)
     }
 
@@ -205,6 +215,7 @@ impl GpuTimer {
                 name,
                 begin,
                 end: self.next_query,
+                exclusive: false,
             });
         }
     }
@@ -309,8 +320,23 @@ impl GpuTimer {
     }
 }
 
-/// Exclusive milliseconds per span, in encoding order. A span whose end precedes its begin (a
-/// reordered or missing sample) is dropped rather than reported as zero.
+fn marker_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("timestamp marker"),
+        source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("timestamp marker"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+/// Milliseconds per span in encoding order, exclusive for render passes. A span whose end precedes
+/// its begin (a reordered or missing sample) is dropped rather than reported as zero.
 fn span_times(spans: &[Span], ticks: &[u64], period_ns: f64) -> Vec<(&'static str, f64)> {
     let mut frontier = 0;
     spans
@@ -321,7 +347,11 @@ fn span_times(spans: &[Span], ticks: &[u64], period_ns: f64) -> Vec<(&'static st
             if end < begin || begin == 0 {
                 return None;
             }
-            let start = begin.max(frontier).min(end);
+            let start = if s.exclusive {
+                begin.max(frontier).min(end)
+            } else {
+                begin
+            };
             frontier = frontier.max(end);
             Some((s.name, (end - start) as f64 * period_ns * 1.0e-6))
         })
@@ -331,36 +361,138 @@ fn span_times(spans: &[Span], ticks: &[u64], period_ns: f64) -> Vec<(&'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atmosphere::tests::headless_device;
+
+    /// The cull pass is timed from an empty marker pass to the next timed pass; an empty encoder
+    /// must still produce its sample on this backend.
+    #[test]
+    fn a_marker_times_untimed_work_up_to_the_next_timed_pass() {
+        let Some((device, queue)) = headless_device(wgpu::Features::TIMESTAMP_QUERY) else {
+            eprintln!("no GPU adapter available, skipping a_marker_times_untimed_work");
+            return;
+        };
+        let mut timer = GpuTimer::new(&device, &queue);
+        if !timer.supported() {
+            eprintln!("no timestamp queries, skipping a_marker_times_untimed_work");
+            return;
+        }
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("busy"),
+            source: wgpu::ShaderSource::Wgsl(
+                "@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+                 @compute @workgroup_size(64)
+                 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                     var x = f32(id.x);
+                     for (var i = 0u; i < 4000u; i++) { x = sin(x) * 1.0001 + 0.1; }
+                     out[id.x] = x;
+                 }
+                 @compute @workgroup_size(1)
+                 fn consume() { out[0] = out[1] + 1.0; }"
+                    .into(),
+            ),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("busy"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("busy out"),
+            size: 64 * 1024 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let consume = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("consume"),
+            layout: None,
+            module: &module,
+            entry_point: Some("consume"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let consume_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("consume"),
+            layout: &consume.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("busy"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+        for _ in 0..3 {
+            timer.begin_frame(&device);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let start = timer.marker(&mut encoder);
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(1024, 1, 1);
+            }
+            timer.span_to_next("cull", start);
+            // Like the terrain pass, which draws from the cull pass's indirect buffer, the next
+            // timed pass depends on the marked work.
+            let mut next = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("next"),
+                timestamp_writes: timer.compute_writes("next"),
+            });
+            next.set_pipeline(&consume);
+            next.set_bind_group(0, &consume_group, &[]);
+            next.dispatch_workgroups(1, 1, 1);
+            drop(next);
+            timer.end_frame(&mut encoder);
+            queue.submit([encoder.finish()]);
+            timer.after_submit();
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("poll");
+        }
+        timer.poll(&device);
+        let timings = timer.timings().expect("timings after three frames");
+        let cull = timings
+            .pass_ms("cull")
+            .expect("the marker span is reported");
+        eprintln!("marker span over untimed work: {cull:.3} ms ({timings:?})");
+        let next = timings.pass_ms("next").expect("the next pass is reported");
+        assert!(
+            cull > 5.0 * next,
+            "the marker span holds the untimed work: {cull} vs {next}"
+        );
+    }
 
     #[test]
-    fn span_times_are_exclusive_and_drop_reversed_spans() {
+    fn render_spans_are_exclusive_compute_spans_raw_and_reversed_spans_dropped() {
+        let span = |name, begin, end, exclusive| Span {
+            name,
+            begin,
+            end,
+            exclusive,
+        };
         let spans = [
-            Span {
-                name: "a",
-                begin: 0,
-                end: 1,
-            },
-            Span {
-                name: "b",
-                begin: 2,
-                end: 3,
-            },
-            Span {
-                name: "c",
-                begin: 1,
-                end: 4,
-            },
+            span("gbuffer", 0, 1, true),
+            span("reversed", 2, 3, false),
+            span("lut", 4, 5, false),
+            span("lighting", 6, 7, true),
         ];
-        // "b" ends before it begins; "c" overlaps "a" and only its time after "a" counts.
-        let ticks = [1_000, 3_000_000, 5_000_000, 4_000_000, 3_500_000];
-        let times = span_times(&spans, &ticks, 1.0);
-        assert_eq!(times.len(), 2);
-        assert_eq!(times[0].0, "a");
-        assert!((times[0].1 - 2.999).abs() < 1e-9);
-        assert_eq!(times[1].0, "c");
-        assert!((times[1].1 - 0.5).abs() < 1e-9);
-        let ticks = [1_000, 2_000_000, 5_000_000, 4_000_000, 3_500_000];
-        let times = span_times(&spans, &ticks, 1.0);
-        assert!((times[1].1 - 1.5).abs() < 1e-9, "{times:?}");
+        // Milliseconds with a period of 1e6 ns per tick. The LUT runs during the G-buffer pass and
+        // keeps its full duration; the lighting pass starts its vertex stage before the G-buffer
+        // ends and is counted from that end.
+        let ticks = [1, 4, 9, 8, 2, 3, 3, 6];
+        let times = span_times(&spans, &ticks, 1.0e6);
+        let names: Vec<_> = times.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["gbuffer", "lut", "lighting"]);
+        assert!((times[0].1 - 3.0).abs() < 1e-9);
+        assert!((times[1].1 - 1.0).abs() < 1e-9);
+        assert!((times[2].1 - 2.0).abs() < 1e-9, "{times:?}");
     }
 }

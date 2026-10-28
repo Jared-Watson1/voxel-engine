@@ -1,7 +1,7 @@
 // HDR to display (D25): exposure, then Khronos PBR Neutral
 // (https://github.com/KhronosGroup/ToneMapping, Apache-2.0), chosen in `crates/vx_render/src/post.rs`.
 // The target is an sRGB view, so the output is linear. Layout matches `TonemapUniform` in
-// `crates/vx_render/src/post.rs`; `tonemap_reference` there mirrors `pbr_neutral`.
+// `crates/vx_render/src/post.rs`, whose tests mirror `pbr_neutral` on the CPU.
 
 struct Tonemap {
     // x: exposure scale (calibration times 2^EV). yzw: reserved.
