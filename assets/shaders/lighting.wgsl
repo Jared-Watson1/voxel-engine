@@ -73,7 +73,7 @@ fn march_view(camera: vec3<f32>, dir: vec3<f32>, t_limit: f32) -> ScatteringResu
         return none;
     }
     let origin = camera + entry * dir;
-    return integrate_scattering(origin, dir, frame.sun_direction.xyz, t_limit - entry, VIEW_STEPS, entry == 0.0, false, true, false);
+    return integrate_scattering(origin, dir, frame.sun_direction.xyz, t_limit - entry, VIEW_STEPS, entry == 0.0, false, true, false, view_ground_radius());
 }
 
 // Outgoing radiance of a Lambert surface at `p` (relative to the planet centre): the sun through
@@ -133,7 +133,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let depth = textureLoad(depth_tex, coord, 0);
     let e_sun = frame.sun_illuminance.rgb;
     let camera_raw = frame.camera.xyz;
-    let camera = lift_above_ground(camera_raw);
+    // View rays start from the camera lifted only above the view ground (valleys below the mean
+    // radius keep their haze); the LUT lookups use the camera lifted to the mean radius.
+    let camera = lift_above_view_ground(camera_raw);
+    let lut_camera = lift_above_ground(camera_raw);
     let camera_r = length(camera);
     let camera_up = camera / camera_r;
     let inside = camera_r < top_radius();
@@ -152,9 +155,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var dir = ray;
     var colour = vec3<f32>(0.0);
     if depth == 0.0 {
-        let fallback_radius = select(bottom_radius(), frame.camera.w, frame.camera.w > 0.0);
+        let fallback_radius = view_ground_radius();
         let t_ground = ray_sphere_nearest(camera, ray, fallback_radius);
-        if t_ground >= 0.0 {
+        // From inside the sphere (a camera flown under the terrain) every ray would exit through
+        // it, so the fallback applies only from outside.
+        if t_ground >= 0.0 && length(camera_raw) > fallback_radius {
             surface = true;
             distance = t_ground;
             let p = camera + t_ground * ray;
@@ -205,8 +210,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     } else {
         march_weight = 1.0 - lut_weight;
         if lut_weight > 0.0 && entry_or_miss >= 0.0 {
-            lut_luminance = sky_view_radiance(camera, ray, false);
-            let origin = camera + entry * ray;
+            lut_luminance = sky_view_radiance(lut_camera, ray, false);
+            let origin = lut_camera + max(distance_to_atmosphere(lut_camera, ray), 0.0) * ray;
             let origin_r = length(origin);
             lut_transmittance = transmittance_to_top(origin_r, dot(ray, origin / origin_r));
         }

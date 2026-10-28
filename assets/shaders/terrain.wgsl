@@ -177,7 +177,13 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
         secondary_position_voxels(unpack_position_voxels(v), normal, vertex_flags(v), mask, frame.zero);
     let local_m = local_voxels * chunk.voxel_size_m;
     // Both terms stay within the rebase distance plus the chunk's distance from the camera (D23).
-    let relative_m = (local_m + chunk.offset_m) - frame.camera_offset_m.xyz;
+    // The position relative to the render origin is rounded where it stands: with the origin on
+    // the voxel grid that sum is exact, so a vertex shared by two chunks of different levels gets
+    // the same bits from both, and fast math must not fold the camera offset into it first.
+    let z = frame.zero;
+    let world_m = local_m + chunk.offset_m;
+    let anchored_m = vec3<f32>(rounded(world_m.x, z), rounded(world_m.y, z), rounded(world_m.z, z));
+    let relative_m = anchored_m - frame.camera_offset_m.xyz;
 
     var out: VertexOut;
     out.clip = frame.view_proj * vec4<f32>(relative_m, 1.0);

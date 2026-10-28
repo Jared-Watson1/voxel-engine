@@ -178,10 +178,9 @@ impl Chunk {
     }
 
     /// True when every sample on `face`'s plane (apron rows included) sits at the distance clamp
-    /// with one sign. The next finer level's field differs from this level's by less than one
-    /// voxel of this level (the octaves a level drops have wavelengths under two node spacings,
-    /// so amplitudes under a voxel, D21), far less than the clamp of about four voxels, so the
-    /// finer surface cannot cross such a face and its transition slab would hold no geometry
+    /// (about four voxels) with one sign. When the next finer level's surface is known to lie
+    /// well within that distance of this level's (the sampler's `level_gap_m` under two voxels),
+    /// the finer surface cannot cross such a face and its transition slab would hold no geometry
     /// (D22, D26). Skipping those slabs saves their height nodes, the dominant cost of a coarse
     /// chunk, because the faces parallel to the ground cover the whole chunk area.
     pub fn face_is_saturated(&self, face: crate::Face) -> bool {

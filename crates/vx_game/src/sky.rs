@@ -53,6 +53,12 @@ impl Sky {
         self.clock.set_warp(WARP_STEPS[self.warp_index]);
     }
 
+    /// Jumps the clock to `time_s` seconds since the epoch.
+    pub fn set_time_s(&mut self, time_s: f64) {
+        self.clock.set_time_s(time_s);
+        self.snapshot = self.system.snapshot(time_s);
+    }
+
     /// Sets an arbitrary warp (for automation); the warp keys then step from the nearest step.
     pub fn set_warp(&mut self, warp: f64) {
         self.clock.set_warp(warp);

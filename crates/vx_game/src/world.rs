@@ -30,8 +30,14 @@ pub const STAGE_NAMES: [&str; 2] = ["generate", "mesh"];
 
 /// Seconds between repeated pool full log lines.
 const POOL_FULL_LOG_INTERVAL_S: f64 = 2.0;
-/// Frames an upload is retried when a pool is full before the key is reported failed.
+/// Frames of failed upload retries after which the failure is counted. The upload keeps retrying
+/// and the key is never reported ready without its mesh, so the octree keeps the parent drawn and
+/// no hole opens (D20); a full pool is an error the overlay shows, not a silent gap.
 const UPLOAD_RETRY_FRAMES: u32 = 120;
+/// A transition slab on a face saturated at the distance clamp (about four voxels) is skipped only
+/// while the sampler's estimate of the gap between this level's surface and the finer one stays
+/// under this many voxels of the level (D26).
+const MAX_GAP_FOR_SLAB_SKIP_VOXELS: f64 = 2.0;
 /// Coarsest level whose resident samples a picking ray reads before falling back to the sampler.
 const PICK_MAX_LEVEL: u8 = 3;
 
@@ -222,9 +228,10 @@ impl World {
 
     /// The render origin sits on the level 0 voxel grid, so every chunk offset is a whole number
     /// of voxels and exact in f32 (under 2^24 voxels), and `local * voxel_size + offset` is exact
-    /// for vertices within 16,384 voxel sizes of their level. Two chunks that share a vertex then
-    /// compute the same f32 position on the GPU whatever their levels (rule 6), as long as the
-    /// voxel size is a power of two (0.25 to 4 m, the design range's powers of two).
+    /// while it stays under 32,768 voxels of its level (packed positions are 1/1024 voxel, face
+    /// vertices 1/512, D26), which `WorldConfig::max_origin_rebase_m` guarantees. Two chunks that
+    /// share a vertex then compute the same f32 position on the GPU whatever their levels (rule 6);
+    /// `WorldConfig::validate` requires the power of two voxel size this needs.
     fn snap_to_voxel_grid(&self, p: DVec3) -> DVec3 {
         snap_to_voxel_grid(p, self.config.voxel_size_m)
     }
@@ -523,16 +530,10 @@ impl World {
                         self.last_pool_full_log = Some(Instant::now());
                     }
                     upload.retries += 1;
-                    if upload.retries < UPLOAD_RETRY_FRAMES {
-                        retry.push(upload);
-                    } else {
+                    if upload.retries == UPLOAD_RETRY_FRAMES {
                         self.stats.upload_failures += 1;
-                        node.pending = false;
-                        if !node.reported {
-                            node.reported = true;
-                            self.lod.mark_failed(key);
-                        }
                     }
+                    retry.push(upload);
                     continue;
                 }
                 Some(Ok(handle)) => {
@@ -753,8 +754,10 @@ impl MeshJob {
         jobs.spawn(STAGE_MESH, priority, token, move |token| {
             let start = Instant::now();
             let base_voxel_size_m = self.sampler.base_voxel_size_m();
+            let skip_saturated = self.sampler.level_gap_m(self.key.level)
+                < MAX_GAP_FOR_SLAB_SKIP_VOXELS * self.chunk.voxel_size_m();
             let slabs = Face::ALL.map(|face| {
-                if self.chunk.face_is_saturated(face) {
+                if skip_saturated && self.chunk.face_is_saturated(face) {
                     return None;
                 }
                 let mut slab = transition_slab(self.key, face, base_voxel_size_m)?;

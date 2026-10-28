@@ -205,8 +205,9 @@ fn measure(sampler: &PlanetSampler, config: &WorldConfig, key: ChunkKey, out: &m
     sampler.fill_chunk(&mut chunk);
     let t1 = Instant::now();
     // As the game does: faces whose samples all sit at the clamp get no slab (D26).
+    let skip_saturated = sampler.level_gap_m(key.level) < 2.0 * chunk.voxel_size_m();
     let slabs = Face::ALL.map(|face| {
-        if chunk.face_is_saturated(face) {
+        if skip_saturated && chunk.face_is_saturated(face) {
             return None;
         }
         let mut slab = transition_slab(key, face, config.voxel_size_m)?;

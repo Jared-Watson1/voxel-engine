@@ -285,13 +285,14 @@ fn integrate_scattering(
     uniform_phase: bool,
     with_multi_scattering: bool,
     with_ground: bool,
+    ground_radius: f32,
 ) -> ScatteringResult {
     var result: ScatteringResult;
     result.luminance = vec3<f32>(0.0);
     result.transmittance = vec3<f32>(1.0);
     result.multi_scat_as_1 = vec3<f32>(0.0);
 
-    let t_bottom = ray_sphere_nearest(origin, dir, bottom_radius());
+    let t_bottom = ray_sphere_nearest(origin, dir, ground_radius);
     var t_top = ray_sphere_nearest(origin, dir, top_radius());
     // An origin moved onto the top sphere has a near intersection at zero up to rounding; the
     // march always runs to the far one, where the ray leaves the atmosphere.
@@ -365,8 +366,26 @@ fn distance_to_atmosphere(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
     return max(t.x, 0.0);
 }
 
-// Origin on or above the ground sphere: a camera in a valley below the mean radius is lifted to
-// it, since the atmosphere's ground is the mean radius.
+// The sphere view rays end on: the radius the terrain never dips below (the cull pass's occluder,
+// `View::camera.w`), so valleys under the mean radius keep their haze; the mean radius when
+// none is given. The LUTs keep the mean radius as their ground.
+fn view_ground_radius() -> f32 {
+    let r = frame.camera.w;
+    return select(bottom_radius(), r, r > 0.0 && r < bottom_radius());
+}
+
+// Origin on or above the view ground sphere, for view rays (the froxels and the per pixel march).
+fn lift_above_view_ground(p: vec3<f32>) -> vec3<f32> {
+    let r = length(p);
+    let floor_r = view_ground_radius() + ground_offset();
+    if r < floor_r {
+        return p * (floor_r / max(r, 1.0e-6));
+    }
+    return p;
+}
+
+// Origin on or above the mean radius sphere, for the LUT parameterisations (sky view and
+// transmittance), whose ground is the mean radius.
 fn lift_above_ground(p: vec3<f32>) -> vec3<f32> {
     let r = length(p);
     let floor_r = bottom_radius() + ground_offset();
@@ -487,7 +506,7 @@ fn multiple_scattering(@builtin(global_invocation_id) id: vec3<u32>, @builtin(lo
     let sin_phi = sqrt(max(1.0 - cos_phi * cos_phi, 0.0));
     let dir = vec3<f32>(cos(theta) * sin_phi, sin(theta) * sin_phi, cos_phi);
 
-    let result = integrate_scattering(origin, dir, sun, 1.0e30, MULTI_SCATTERING_STEPS, true, true, false, true);
+    let result = integrate_scattering(origin, dir, sun, 1.0e30, MULTI_SCATTERING_STEPS, true, true, false, true, bottom_radius());
     let weight = 4.0 * PI / f32(MS_DIRECTIONS);
     shared_luminance[index] = result.luminance * weight;
     shared_multi_scat[index] = result.multi_scat_as_1 * weight;
@@ -537,7 +556,7 @@ fn sky_view(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let steps = mix(SKY_VIEW_MIN_STEPS, SKY_VIEW_MAX_STEPS, clamp(length_m / atmosphere.radii.w, 0.0, 1.0));
     // From outside the atmosphere the densest air is mid ray, so the steps are uniform.
-    let result = integrate_scattering(origin, dir, sun, 1.0e30, floor(steps), entry == 0.0, false, true, false);
+    let result = integrate_scattering(origin, dir, sun, 1.0e30, floor(steps), entry == 0.0, false, true, false, bottom_radius());
     textureStore(sky_view_out, id.xy, vec4<f32>(result.luminance, 1.0));
 }
 
@@ -554,7 +573,7 @@ fn aerial_perspective(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= size || id.y >= size {
         return;
     }
-    let camera = lift_above_ground(frame.camera.xyz);
+    let camera = lift_above_view_ground(frame.camera.xyz);
     let uv = (vec2<f32>(id.xy) + 0.5) / AERIAL_SIZE;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let dir = normalize(unproject(ndc, 1.0));
@@ -568,7 +587,7 @@ fn aerial_perspective(@builtin(global_invocation_id) id: vec3<u32>) {
     let origin = camera + entry * dir;
     let sun = frame.sun_direction.xyz;
     var t_end = ray_sphere(origin, dir, top_radius()).y;
-    let t_ground = ray_sphere_nearest(origin, dir, bottom_radius());
+    let t_ground = ray_sphere_nearest(origin, dir, view_ground_radius());
     if t_ground > 0.0 {
         t_end = min(t_end, t_ground);
     }

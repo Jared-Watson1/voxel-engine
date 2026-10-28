@@ -3,20 +3,17 @@
 //!
 //! M2 samples a planet (D21): seeded fBm of the unit direction on a per level cube sphere grid,
 //! plus 3D detail noise, with materials by altitude, depth and slope against the radial up. The
-//! M1 flat `TerrainSampler` remains only while `vx_game` still streams the flat world. The planet
-//! atlas arrives in M3.
+//! planet atlas arrives in M3.
 
 mod cache;
 mod cubemap;
 mod height;
 mod planet;
-mod sampler;
 mod seed;
 mod textures;
 
 pub use cache::HeightCacheStats;
 pub use planet::{ChunkClass, PlanetSampler};
-pub use sampler::TerrainSampler;
 pub use textures::{MaterialTextureSet, material_textures};
 
 #[cfg(test)]

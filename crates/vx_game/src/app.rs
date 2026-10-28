@@ -724,7 +724,10 @@ impl Running {
                     );
                     self.renderer.set_material_textures(&startup.textures);
                     self.replace_world(startup.config, startup.system);
-                    if let Some(warp) = args.warp
+                    // Automated runs hold the sun where --time-of-day put it, so screenshots and
+                    // GPU measurements do not depend on how long streaming took.
+                    let warp = args.warp.or(args.automated().then_some(0.0));
+                    if let Some(warp) = warp
                         && let Some(sky) = &mut self.sky
                     {
                         sky.set_warp(warp);
@@ -765,6 +768,17 @@ impl Running {
 
     fn replace_world(&mut self, config: WorldConfig, system: SystemConfig) {
         let planet = system.planet.params;
+        // The star system can change on its own (a hot edit of the orbit or the moon); the new
+        // sky keeps the running clock and warp so the sun does not jump.
+        if self.sky.as_ref().is_none_or(|s| *s.config() != system) {
+            let previous = self.sky.as_ref().map(|s| (s.time_s(), s.warp()));
+            let mut sky = Sky::new(system);
+            if let Some((time_s, warp)) = previous {
+                sky.set_time_s(time_s);
+                sky.set_warp(warp);
+            }
+            self.sky = Some(sky);
+        }
         if let Some(mut old) = self.world.take() {
             if *old.config() == config && *old.planet() == planet {
                 self.world = Some(old);
@@ -775,10 +789,6 @@ impl Running {
         }
         self.renderer
             .set_atmosphere(&planet.atmosphere, planet.radius_m());
-        let sky_changed = self.sky.as_ref().is_none_or(|s| *s.config() != system);
-        if sky_changed {
-            self.sky = Some(Sky::new(system));
-        }
         let mut world = World::new(config, planet, self.jobs.clone(), self.camera.position.m);
         if !self.camera_placed {
             self.place_camera(&mut world);

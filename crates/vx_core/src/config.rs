@@ -17,6 +17,8 @@ pub enum ConfigError {
     },
     #[error("parsing world config: {0}")]
     Parse(#[from] ron::error::SpannedError),
+    #[error("{field} = {value} must be a power of two")]
+    NotPowerOfTwo { field: &'static str, value: f64 },
     #[error("{field} = {value} is outside the supported range {min} to {max}")]
     OutOfRange {
         field: &'static str,
@@ -36,8 +38,9 @@ pub enum ConfigError {
 pub struct WorldConfig {
     /// Edge length of one level 0 voxel in metres; level `L` voxels are `2^L` times larger.
     /// Design default 1.0 (D11): 0.5 doubles memory and meshing cost per visible area, and 1 m
-    /// matches godot_voxel, Veloren and Space Engineers class engines. Supported range
-    /// [`WorldConfig::VOXEL_SIZE_RANGE_M`].
+    /// matches godot_voxel, Veloren and Space Engineers class engines. Supported values: the
+    /// powers of two in [`WorldConfig::VOXEL_SIZE_RANGE_M`] (0.25, 0.5, 1, 2, 4), so vertex
+    /// positions and chunk offsets are exact in f32 and LOD seams meet bit for bit (D23, D26).
     pub voxel_size_m: f64,
     /// World seed (D5). Every generated value is a pure function of position and this seed.
     /// Design default 1.
@@ -57,7 +60,8 @@ pub struct WorldConfig {
     pub lod_hysteresis_chunks: f64,
     /// The render origin rebases when the camera is farther than this from it (D4, D23). Design
     /// default 4,000 m: f32 offsets within it keep a quarter millimetre of resolution. Supported
-    /// range [`WorldConfig::ORIGIN_REBASE_RANGE_M`].
+    /// range [`WorldConfig::ORIGIN_REBASE_RANGE_M`], further limited by
+    /// [`WorldConfig::max_origin_rebase_m`] so vertex sums stay exact.
     pub origin_rebase_m: f64,
 }
 
@@ -500,7 +504,28 @@ impl WorldConfig {
             "origin_rebase_m",
             self.origin_rebase_m,
             &Self::ORIGIN_REBASE_RANGE_M,
+        )?;
+        if self.voxel_size_m.log2().fract() != 0.0 {
+            return Err(ConfigError::NotPowerOfTwo {
+                field: "voxel_size_m",
+                value: self.voxel_size_m,
+            });
+        }
+        check(
+            "origin_rebase_m",
+            self.origin_rebase_m,
+            &(*Self::ORIGIN_REBASE_RANGE_M.start()..=self.max_origin_rebase_m()),
         )
+    }
+
+    /// Largest rebase distance at which every drawn vertex's position relative to the render
+    /// origin stays exact in f32: packed positions are 1/1024 voxel, so a level's sums are exact
+    /// below 32,768 of its voxels, and level 0 chunks reach `lod_radius_chunks +
+    /// lod_hysteresis_chunks` extents plus two chunks of slack from the camera.
+    pub fn max_origin_rebase_m(&self) -> f64 {
+        let reach_voxels =
+            (self.lod_radius_chunks + self.lod_hysteresis_chunks + 2.0) * CHUNK_SIZE as f64;
+        (32_768.0 - reach_voxels) * self.voxel_size_m
     }
 
     /// Edge length of one level 0 chunk in metres.
@@ -702,6 +727,7 @@ mod tests {
             "(lod_levels: 15)",
             "(lod_radius_chunks: 1.0)",
             "(origin_rebase_m: 100.0)",
+            "(voxel_size_m: 0.25, origin_rebase_m: 16000.0)",
         ] {
             let r = WorldConfig::from_ron_str(text);
             assert!(matches!(r, Err(ConfigError::OutOfRange { .. })), "{text}");
@@ -725,6 +751,20 @@ mod tests {
             let r = planet(text);
             assert!(matches!(r, Err(ConfigError::OutOfRange { .. })), "{text}");
         }
+    }
+
+    #[test]
+    fn voxel_sizes_must_be_powers_of_two() {
+        for v in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            WorldConfig::from_ron_str(&format!("(voxel_size_m: {v:?})")).unwrap();
+        }
+        for v in [0.3, 0.75, 1.5, 3.0] {
+            assert!(matches!(
+                WorldConfig::from_ron_str(&format!("(voxel_size_m: {v:?})")),
+                Err(ConfigError::NotPowerOfTwo { .. })
+            ));
+        }
+        assert!(WorldConfig::default().max_origin_rebase_m() > 30_000.0);
     }
 
     #[test]

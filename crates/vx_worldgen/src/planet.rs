@@ -375,6 +375,40 @@ impl PlanetSampler {
         self.radius_m
     }
 
+    /// Estimate in metres of how far the surface of `level` can lie from the surface of the next
+    /// finer level at the same place: octaves the coarse level drops count fully, kept octaves
+    /// count by Catmull-Rom's error at their sampling density (half under four nodes per
+    /// wavelength, a tenth under eight), and the detail noise counts when the coarse level drops
+    /// it and the fine one keeps it. An engineering estimate rather than a proof; the game skips a
+    /// transition slab on a face saturated at the distance clamp only while it stays under two
+    /// voxels of the level (D26).
+    pub fn level_gap_m(&self, level: u8) -> f64 {
+        let Some(fine) = level.checked_sub(1) else {
+            return 0.0;
+        };
+        let (coarse, fine) = (self.level(level), self.level(fine));
+        let spacing = SPACING_MAX_OVER_MEAN * coarse.voxel_size_m;
+        let height = self
+            .noise
+            .weighted_octave_height_m(spacing, |nodes_per_wavelength| {
+                if nodes_per_wavelength < 2.0 {
+                    1.0
+                } else if nodes_per_wavelength < 4.0 {
+                    0.5
+                } else if nodes_per_wavelength < 8.0 {
+                    0.1
+                } else {
+                    0.0
+                }
+            });
+        let detail = if fine.detail && !coarse.detail {
+            fine.detail_amplitude_m
+        } else {
+            0.0
+        };
+        height + detail
+    }
+
     /// Inner and outer radius between which the surface lies at every level: outside the outer
     /// radius every sample of every level is outside the solid (positive distance), inside the
     /// inner radius every sample is inside. Margins: the amplitude, the Catmull-Rom overshoot

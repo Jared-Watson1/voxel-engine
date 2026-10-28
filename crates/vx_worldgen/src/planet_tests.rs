@@ -732,3 +732,28 @@ fn catmull_rom_bounds_hold() {
     // The bounds are reached (at s = t = 1/2), so they are tight as well as sound.
     assert!(negative_2d > CATMULL_ROM_OVERSHOOT - 1e-9 && difference_sum > 1.5 - 1e-9);
 }
+
+#[test]
+fn level_gap_allows_the_slab_skip_at_the_defaults_but_not_at_rough_range_ends() {
+    let s = sampler();
+    for level in 1..8u8 {
+        let voxel = s.base_voxel_size_m() * f64::from(1u32 << level);
+        let gap = s.level_gap_m(level);
+        println!("level {level}: gap {gap:.3} m, {:.3} voxels", gap / voxel);
+        assert!(gap < 2.0 * voxel, "level {level} gap {gap} m");
+    }
+    assert_eq!(s.level_gap_m(0), 0.0);
+    let rough = PlanetSampler::new(
+        1,
+        &PlanetParams {
+            terrain: vx_core::TerrainParams {
+                amplitude_m: 2000.0,
+                wavelength_m: 16.0,
+                ..vx_core::TerrainParams::planet_default()
+            },
+            ..PlanetParams::default()
+        },
+        1.0,
+    );
+    assert!(rough.level_gap_m(4) > 2.0 * 16.0);
+}

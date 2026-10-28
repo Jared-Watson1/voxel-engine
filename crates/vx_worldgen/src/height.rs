@@ -105,6 +105,22 @@ impl HeightNoise {
         self.amplitude_m
     }
 
+    /// Height in metres an octave of wavelength under `spacing_m` times `samples_per_wavelength`
+    /// can move, weighted by `weight(wavelength / spacing)`: the octave's share of the normalised
+    /// sum times the amplitude and the hill shaping's largest slope (`1 + HILL_SHARPNESS`).
+    pub(crate) fn weighted_octave_height_m(
+        &self,
+        spacing_m: f64,
+        weight: impl Fn(f64) -> f64,
+    ) -> f64 {
+        let share: f64 = self
+            .octaves
+            .iter()
+            .map(|o| o.amplitude * weight(o.wavelength_m / spacing_m))
+            .sum();
+        share * self.inv_amplitude_sum * self.amplitude_m * (1.0 + HILL_SHARPNESS)
+    }
+
     pub(crate) fn base_height_m(&self) -> f64 {
         self.base_height_m
     }
