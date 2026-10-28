@@ -11,7 +11,8 @@
 //! G-buffer. Lighting and the sky (D25): the atmosphere LUTs, one fullscreen lighting pass into an
 //! HDR target and a tonemap pass into the swapchain, with egui on top.
 //!
-//! Frame order: cull, terrain G-buffer, atmosphere LUTs, lighting, tonemap, egui.
+//! Frame order: cull, terrain G-buffer, atmosphere LUTs, lighting, tonemap, egui. Each pass is
+//! timed with timestamp queries at its boundaries when the adapter has them ([`GpuTimings`]).
 
 mod atmosphere;
 mod capture;
@@ -20,6 +21,7 @@ mod materials;
 mod pool;
 mod post;
 mod terrain;
+mod timing;
 
 use std::sync::Arc;
 
@@ -212,8 +214,35 @@ pub struct GpuTimings {
 }
 
 impl GpuTimings {
+    /// Names of the passes that count against [`Budgets::SKY_AND_LIGHTING_MS`]: the four LUT
+    /// passes (the static two only on frames after a parameter change) and the lighting pass.
+    pub const SKY_AND_LIGHTING_PASSES: [&'static str; 5] = [
+        "transmittance lut",
+        "multiple scattering lut",
+        "sky view lut",
+        "aerial perspective lut",
+        "lighting",
+    ];
+
     pub fn total_ms(&self) -> f64 {
         self.passes.iter().map(|(_, ms)| ms).sum()
+    }
+
+    /// Milliseconds of the named pass, `None` when it was not timed in this frame.
+    pub fn pass_ms(&self, name: &str) -> Option<f64> {
+        self.passes
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ms)| *ms)
+    }
+
+    /// GPU time of the atmosphere LUTs and the lighting pass, the sky and lighting budget.
+    pub fn sky_and_lighting_ms(&self) -> f64 {
+        self.passes
+            .iter()
+            .filter(|(n, _)| Self::SKY_AND_LIGHTING_PASSES.contains(n))
+            .map(|(_, ms)| ms)
+            .sum()
     }
 }
 
@@ -352,6 +381,7 @@ pub struct Renderer {
     post: post::PostPass,
     egui: egui_wgpu::Renderer,
     capture: capture::Capture,
+    timer: timing::GpuTimer,
     info: GpuInfo,
 }
 
@@ -393,10 +423,13 @@ impl Renderer {
                     .min(adapter_limits.max_buffer_size),
             });
         }
+        // Timestamps at pass boundaries are all Apple GPUs offer; requested when present so the
+        // overlay can show GPU time per pass (engineering rule 4).
+        let required_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("vx device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits,
                 ..Default::default()
             }))?;
@@ -468,6 +501,10 @@ impl Renderer {
         let post = post::PostPass::new(&device, scene_format);
         let egui = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let capture = capture::Capture::new(usage.contains(wgpu::TextureUsages::COPY_SRC));
+        let timer = timing::GpuTimer::new(&device, &queue);
+        if !timer.supported() {
+            tracing::info!("no timestamp queries on this adapter; GPU pass timings disabled");
+        }
 
         Ok(Self {
             surface,
@@ -482,6 +519,7 @@ impl Renderer {
             post,
             egui,
             capture,
+            timer,
             info,
         })
     }
@@ -534,7 +572,7 @@ impl Renderer {
     /// GPU time per pass, or `None` when the adapter has no timestamp queries or no readback has
     /// completed yet.
     pub fn gpu_timings(&self) -> Option<GpuTimings> {
-        None
+        self.timer.timings()
     }
 
     /// Uploads a prepared material texture array (mip chains built by
@@ -657,8 +695,10 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        self.timer.begin_frame(&self.device);
         self.terrain.prepare_frame(&self.device, &self.queue, frame);
-        self.atmosphere.prepare_frame(&self.queue, frame);
+        self.atmosphere
+            .prepare_frame(&self.queue, frame, self.config.width, self.config.height);
         self.post.prepare_frame(&self.queue, frame);
 
         let mut encoder = self
@@ -666,7 +706,11 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        // The cull pass opens its own untimed compute passes; it is timed from an empty marker
+        // pass to the start of the terrain pass.
+        let cull_start = self.timer.marker(&mut encoder);
         self.terrain.encode_cull(&mut encoder);
+        self.timer.span_to_next("cull", cull_start);
 
         {
             profiling::scope!("terrain pass");
@@ -698,18 +742,23 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.timer.render_writes("terrain"),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
         }
         self.terrain.encode_readback(&mut encoder);
-        self.atmosphere.encode_luts(&mut encoder);
+        self.atmosphere.encode_luts(&mut encoder, &mut self.timer);
         self.atmosphere
-            .encode_lighting(&self.device, &mut encoder, &self.targets);
-        self.post
-            .encode_tonemap(&self.device, &mut encoder, &self.targets.hdr, &scene_view);
+            .encode_lighting(&self.device, &mut encoder, &self.targets, &mut self.timer);
+        self.post.encode_tonemap(
+            &self.device,
+            &mut encoder,
+            &self.targets,
+            &scene_view,
+            &mut self.timer,
+        );
 
         let mut extra_buffers = Vec::new();
         if let Some(ui) = &frame.egui {
@@ -738,7 +787,7 @@ impl Renderer {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: self.timer.render_writes("egui"),
                     occlusion_query_set: None,
                     multiview_mask: None,
                 })
@@ -748,6 +797,7 @@ impl Renderer {
 
         self.capture
             .encode_copy(&self.device, &mut encoder, &surface_texture.texture);
+        self.timer.end_frame(&mut encoder);
 
         {
             profiling::scope!("submit and present");
@@ -755,6 +805,7 @@ impl Renderer {
                 .submit(extra_buffers.into_iter().chain([encoder.finish()]));
             self.capture.after_submit();
             self.terrain.after_submit();
+            self.timer.after_submit();
             self.queue.present(surface_texture);
         }
 
@@ -769,12 +820,14 @@ pub(crate) struct FrameTargets {
     pub(crate) normal: wgpu::TextureView,
     pub(crate) depth: wgpu::TextureView,
     pub(crate) hdr: wgpu::TextureView,
+    /// Unique per instance, so passes caching bind groups of these views rebuild them on resize.
+    pub(crate) generation: u64,
 }
 
 impl FrameTargets {
     fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        let view = |label, format| {
+        let view = |label, format, extra: wgpu::TextureUsages| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
@@ -787,16 +840,19 @@ impl FrameTargets {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format,
-                    usage,
+                    usage: usage | extra,
                     view_formats: &[],
                 })
                 .create_view(&wgpu::TextureViewDescriptor::default())
         };
+        let none = wgpu::TextureUsages::empty();
         Self {
-            albedo: view("gbuffer albedo", GBUFFER_ALBEDO_FORMAT),
-            normal: view("gbuffer normal", GBUFFER_NORMAL_FORMAT),
-            depth: view("depth", DEPTH_FORMAT),
-            hdr: view("hdr", HDR_FORMAT),
+            albedo: view("gbuffer albedo", GBUFFER_ALBEDO_FORMAT, none),
+            normal: view("gbuffer normal", GBUFFER_NORMAL_FORMAT, none),
+            depth: view("depth", DEPTH_FORMAT, none),
+            // Copyable for readbacks of the lit frame in tests and debugging.
+            hdr: view("hdr", HDR_FORMAT, wgpu::TextureUsages::COPY_SRC),
+            generation: atmosphere::next_targets_generation(),
         }
     }
 }
