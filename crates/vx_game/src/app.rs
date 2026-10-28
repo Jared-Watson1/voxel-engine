@@ -118,6 +118,13 @@ struct BenchPeaks {
     triangles_max: u32,
     visible_max: u32,
     edits: u64,
+    /// Sums and maxima of the GPU pass times read back during the measurement.
+    gpu_samples: u32,
+    gpu_total_ms_sum: f64,
+    gpu_terrain_ms_sum: f64,
+    gpu_sky_ms_sum: f64,
+    gpu_total_ms_max: f64,
+    gpu_sky_ms_max: f64,
 }
 
 struct Running {
@@ -139,6 +146,7 @@ struct Running {
     sky: Option<Sky>,
     exposure_ev: f32,
     start_time_of_day: Option<f64>,
+    start_altitude_km: Option<f64>,
     world_error: Option<String>,
     shader_error: Option<String>,
     brush: BrushSettings,
@@ -358,6 +366,7 @@ impl Running {
             sky: None,
             exposure_ev: args.exposure_ev,
             start_time_of_day: args.time_of_day,
+            start_altitude_km: args.altitude_km,
             world_error: None,
             shader_error: None,
             brush: BrushSettings {
@@ -543,6 +552,16 @@ impl Running {
                 if let Some(c) = self.renderer.cull_stats() {
                     self.peaks.triangles_max = self.peaks.triangles_max.max(c.triangles);
                     self.peaks.visible_max = self.peaks.visible_max.max(c.visible_chunks);
+                }
+                if let Some(t) = self.renderer.gpu_timings() {
+                    let p = &mut self.peaks;
+                    let (total, sky) = (t.total_ms(), t.sky_and_lighting_ms());
+                    p.gpu_samples += 1;
+                    p.gpu_total_ms_sum += total;
+                    p.gpu_terrain_ms_sum += t.pass_ms("terrain").unwrap_or(0.0);
+                    p.gpu_sky_ms_sum += sky;
+                    p.gpu_total_ms_max = p.gpu_total_ms_max.max(total);
+                    p.gpu_sky_ms_max = p.gpu_sky_ms_max.max(sky);
                 }
             }
         }
@@ -779,18 +798,26 @@ impl Running {
             dir = dir.normalize();
         }
         let radius = world.planet().radius_m();
-        let eye = dir * (radius + world.sampler().height_m(dir) + EYE_HEIGHT_M);
+        let ground = radius + world.sampler().height_m(dir);
         let sun = self
             .sky
             .as_ref()
             .map_or(tangent_axes(dir).0, |s| s.snapshot().sun_direction);
         let heading = sun - dir * sun.dot(dir);
         let heading = heading.normalize_or(tangent_axes(dir).0);
-        self.camera = FlyCamera::looking_at(
-            WorldPos::body_fixed(eye),
-            eye + heading * 100.0 - dir * 3.0,
-            self.camera.projection,
-        );
+        let (eye, target) = match self.start_altitude_km {
+            // High up, looking at a point beside the planet centre so the lit limb is in view.
+            Some(km) => {
+                let eye = dir * (ground + km * 1000.0);
+                (eye, heading * (0.6 * radius))
+            }
+            None => {
+                let eye = dir * (ground + EYE_HEIGHT_M);
+                (eye, eye + heading * 100.0 - dir * 3.0)
+            }
+        };
+        self.camera =
+            FlyCamera::looking_at(WorldPos::body_fixed(eye), target, self.camera.projection);
         world.set_origin(eye);
         self.camera_placed = true;
     }
@@ -954,7 +981,7 @@ impl Running {
                 .collect::<Vec<_>>()
                 .join("/")
         });
-        let gpu = self.renderer.gpu_timings();
+        let gpu_mean = |sum: f64| sum / f64::from(self.peaks.gpu_samples.max(1));
         let line = format!(
             "BENCH voxel_size_m={} radius_km={} lod_levels={} lod_radius_chunks={} seed={} \
              resolution={}x{} present_mode={} adapter=\"{}\" workers={} descent={} \
@@ -967,7 +994,8 @@ impl Running {
              queue_peak={} generate_ms_mean={:.3} generate_ms_max={:.3} mesh_ms_mean={:.3} \
              mesh_ms_max={:.3} generated={} meshed={} uploaded={} upload_failures={} splits={} \
              merges={} lod_ms_max={:.3} rebases={} rebase_ms_max={:.3} world_update_ms_max={:.3} \
-             gpu_ms={:.3}",
+             gpu_ms_mean={:.3} gpu_ms_max={:.3} gpu_terrain_ms_mean={:.3} \
+             gpu_sky_lighting_ms_mean={:.3} gpu_sky_lighting_ms_max={:.3}",
             config.map_or(f64::NAN, |c| c.voxel_size_m),
             planet.map_or(f64::NAN, |p| p.radius_km),
             config.map_or(0, |c| c.lod_levels),
@@ -1025,7 +1053,11 @@ impl Running {
             stats.as_ref().map_or(0, |s| s.rebases),
             stats.as_ref().map_or(0.0, |s| s.rebase_ms_max),
             stats.as_ref().map_or(0.0, |s| s.update_ms_max),
-            gpu.map_or(f64::NAN, |g| g.total_ms()),
+            gpu_mean(self.peaks.gpu_total_ms_sum),
+            self.peaks.gpu_total_ms_max,
+            gpu_mean(self.peaks.gpu_terrain_ms_sum),
+            gpu_mean(self.peaks.gpu_sky_ms_sum),
+            self.peaks.gpu_sky_ms_max,
         );
         println!("{line}");
     }

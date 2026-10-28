@@ -755,6 +755,9 @@ impl MeshJob {
             let start = Instant::now();
             let base_voxel_size_m = self.sampler.base_voxel_size_m();
             let slabs = Face::ALL.map(|face| {
+                if face_is_saturated(&self.chunk, face) {
+                    return None;
+                }
                 let mut slab = transition_slab(self.key, face, base_voxel_size_m)?;
                 self.sampler.fill_block(&mut slab);
                 for brush in self.edits.iter() {
@@ -777,5 +780,41 @@ impl MeshJob {
                 mesh_ms: start.elapsed().as_secs_f64() * 1.0e3,
             });
         });
+    }
+}
+
+/// True when every coarse sample on `face`'s plane (apron rows included) is saturated at the
+/// distance clamp with one sign. The finer level's field differs from this level's by less than
+/// one voxel of this level (the octaves dropped here have wavelengths under two node spacings and
+/// so amplitudes under a voxel, D21), far less than the clamp of about four voxels, so the fine
+/// surface cannot cross this face and its slab would hold no transition geometry. Skipping it
+/// saves the slab's height nodes, the dominant cost of a coarse chunk (the faces parallel to the
+/// ground cover the whole chunk area).
+fn face_is_saturated(chunk: &Chunk, face: Face) -> bool {
+    let plane = if face.is_high() {
+        CHUNK_SIZE as isize
+    } else {
+        0
+    };
+    let first = chunk_face_sample(chunk, face, plane, -1, -1).distance;
+    if first.unsigned_abs() < i8::MAX as u8 {
+        return false;
+    }
+    let last = CHUNK_SIZE as isize + 1;
+    for v in -1..=last {
+        for u in -1..=last {
+            if chunk_face_sample(chunk, face, plane, u, v).distance != first {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn chunk_face_sample(chunk: &Chunk, face: Face, plane: isize, u: isize, v: isize) -> Voxel {
+    match face.axis() {
+        0 => chunk.get(plane, u, v),
+        1 => chunk.get(u, plane, v),
+        _ => chunk.get(u, v, plane),
     }
 }

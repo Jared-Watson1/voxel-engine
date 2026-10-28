@@ -35,6 +35,8 @@ pub struct Args {
     pub warp: Option<f64>,
     /// Exposure in stops.
     pub exposure_ev: f32,
+    /// Start this high above the terrain, looking down at the planet, instead of standing.
+    pub altitude_km: Option<f64>,
     /// Apply a scripted dig or place every few frames during the measurement.
     pub edit_test: bool,
     /// Brush radius in voxels at startup.
@@ -73,6 +75,7 @@ OPTIONS:
     --time-of-day <f>       local solar time at the start, fraction of a day (0.25 sunrise)
     --warp <x>              simulation seconds per real second at startup (default 1)
     --exposure <ev>         exposure in stops (default 0.5)
+    --altitude <km>         start this high above the terrain looking down at the planet
     --edit-test             apply scripted brushes during the measurement
     --brush-radius <voxels> brush radius at startup (default 3)
     --no-overlay            hide the debug overlay
@@ -118,6 +121,7 @@ impl Args {
             time_of_day: None,
             warp: None,
             exposure_ev: DEFAULT_EXPOSURE_EV,
+            altitude_km: None,
             edit_test: false,
             brush_radius_voxels: None,
             no_overlay: false,
@@ -138,6 +142,7 @@ impl Args {
                 "--time-of-day" => args.time_of_day = Some(value()?.parse()?),
                 "--warp" => args.warp = Some(value()?.parse()?),
                 "--exposure" => args.exposure_ev = value()?.parse()?,
+                "--altitude" => args.altitude_km = Some(value()?.parse()?),
                 "--seed" => args.seed = Some(value()?.parse()?),
                 "--workers" => args.workers = Some(value()?.parse()?),
                 "--no-vsync" => args.vsync = false,
