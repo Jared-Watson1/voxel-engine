@@ -13,6 +13,7 @@ mod key;
 pub mod lod;
 mod mesh;
 mod store;
+mod transvoxel;
 
 pub use block::{SLAB_DEPTH, SLAB_WIDTH, SampleBlock, transition_slab};
 pub use brush::{Brush, BrushOp, BrushShape};

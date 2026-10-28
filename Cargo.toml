@@ -43,7 +43,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-transvoxel = "2.0.0"
+transvoxel-data = "0.2.1"
 wgpu = "30.0.1"
 winit = "0.30.13"
 

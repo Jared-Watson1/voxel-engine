@@ -1,6 +1,7 @@
 //! Mesh invariants on an analytic sphere: closed, consistently wound, outward facing, on the
 //! surface, and bit identical across the supported voxel sizes (D11). Exact seams between chunks
-//! sharing a face (D15, D16), the material rule, finite packed attributes and timing.
+//! sharing a face (D16, D22), face vertices on the coarser level's packed grid, the material rule,
+//! finite packed attributes and timing. Seams between levels are in `tests/transition_seams.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
@@ -553,4 +554,36 @@ fn shared_face_vertices_are_identical_at_odd_voxel_sizes() {
         );
         assert_eq!(on_a, on_b, "shared face differs at {voxel_size_m} m");
     }
+}
+
+/// Vertices on a chunk face sit on even packed units (1/512 voxel), so the transition cells of a
+/// chunk one level coarser, whose packed unit is twice as large, hold them exactly (D22).
+#[test]
+fn face_vertices_sit_on_the_coarser_packed_grid() {
+    let far = CHUNK_SIZE as u32 * POSITION_UNITS_PER_VOXEL as u32;
+    let mut on_faces = 0;
+    for chunk in [noisy_plane_chunk(), sphere_chunk(1.0).0] {
+        for vertex in mesh_chunk(&chunk).vertices {
+            let coords = [0, 1, 2].map(|axis| packed_coordinate(vertex, axis));
+            if coords.iter().any(|&c| c == 0 || c == far) {
+                on_faces += 1;
+                assert!(
+                    coords.iter().all(|c| c % 2 == 0),
+                    "face vertex at {coords:?}"
+                );
+            }
+        }
+    }
+    assert!(on_faces > 0, "no vertices on the chunk faces");
+}
+
+/// Without slabs the level of detail mesher is the regular mesher, with empty transition ranges.
+#[test]
+fn lod_mesh_without_slabs_is_the_regular_mesh() {
+    let chunk = noisy_plane_chunk();
+    let plain = mesh_chunk(&chunk);
+    let lod = crate::mesh_chunk_lod(&chunk, &[None, None, None, None, None, None]);
+    assert_eq!(lod, plain);
+    assert_eq!(lod.regular_index_count as usize, lod.indices.len());
+    assert_eq!(lod.transition_index_counts, [0; 6]);
 }

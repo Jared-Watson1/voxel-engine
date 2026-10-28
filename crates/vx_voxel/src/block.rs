@@ -1,7 +1,7 @@
 use glam::{DVec3, IVec3, UVec3};
 use vx_core::CHUNK_SIZE;
 
-use crate::chunk::Voxel;
+use crate::chunk::{Material, Voxel};
 use crate::key::{ChunkKey, Face};
 
 /// A box of samples at one octree level outside any chunk: the fine resolution slabs that a
@@ -90,6 +90,32 @@ impl SampleBlock {
     pub fn voxels_mut(&mut self) -> &mut [Voxel] {
         &mut self.voxels
     }
+
+    /// Fills every sample from a function returning the signed distance in metres (negative
+    /// inside) and the material of the solid, with the arithmetic of
+    /// `Chunk::fill_from_with_material`, so a block and a chunk of one level sampling one function
+    /// agree bit for bit wherever both hold a sample.
+    pub fn fill_from_with_material(&mut self, sample: impl Fn(DVec3) -> (f64, Material)) {
+        profiling::scope!("SampleBlock::fill_from");
+        let inv_voxel = 1.0 / self.voxel_size_m;
+        let mut i = 0;
+        for z in 0..self.dims.z as i32 {
+            for y in 0..self.dims.y as i32 {
+                for x in 0..self.dims.x as i32 {
+                    let world = self.min + IVec3::new(x, y, z);
+                    let (distance_m, material) = sample(self.sample_position(world));
+                    let distance = Voxel::quantise_distance(distance_m * inv_voxel);
+                    let material = if distance < 0 {
+                        material
+                    } else {
+                        Material::AIR
+                    };
+                    self.voxels[i] = Voxel { distance, material };
+                    i += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Samples across a slab: one on each side of the face plane, for central difference gradients.
@@ -144,5 +170,30 @@ mod tests {
         assert_eq!(b.index(IVec3::new(-1, 5, 7)), Some(b.voxels().len() - 1));
         assert_eq!(b.get(IVec3::new(0, 5, 7)), None);
         assert_eq!(b.get(IVec3::new(-3, 3, 4)), None);
+    }
+
+    #[test]
+    fn slab_fill_matches_the_chunk_at_the_same_level() {
+        let sdf = |p: DVec3| (p.y - 0.37 * p.x - 0.21 * p.z - 3.3, crate::Material::SOIL);
+        for voxel_size_m in [0.25, 0.3, 1.0, 4.0] {
+            let key = ChunkKey::at_level(1, 0, 0, 0);
+            let mut slab = transition_slab(key, Face::LowX, voxel_size_m).unwrap();
+            slab.fill_from_with_material(sdf);
+            // The fine chunk across the low x face holds the slab's samples at local x 31 to 33.
+            let mut fine = crate::Chunk::new(ChunkKey::new(-1, 0, 0), voxel_size_m);
+            fine.fill_from_with_material(sdf);
+            for z in -1..=33 {
+                for y in -1..=33 {
+                    for x in 31..=33 {
+                        let world = ChunkKey::new(-1, 0, 0).world_sample(IVec3::new(x, y, z));
+                        assert_eq!(
+                            slab.get(world),
+                            Some(fine.get(x as isize, y as isize, z as isize)),
+                            "{world} at {voxel_size_m} m"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
