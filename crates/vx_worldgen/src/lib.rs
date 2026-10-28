@@ -6,11 +6,15 @@
 //! M1 flat `TerrainSampler` remains until the benchmark moves to the planet. The planet atlas
 //! arrives in M3.
 
+mod cache;
+mod cubemap;
+mod height;
 mod planet;
 mod sampler;
 mod seed;
 mod textures;
 
+pub use cache::HeightCacheStats;
 pub use planet::{ChunkClass, PlanetSampler};
 pub use sampler::TerrainSampler;
 pub use textures::{MaterialTextureSet, material_textures};
