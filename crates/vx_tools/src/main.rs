@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use glam::DVec3;
 use vx_core::{Budgets, CHUNK_SIZE, PlanetParams, WorldConfig, WorldPos};
-use vx_voxel::{Chunk, ChunkKey, ChunkStore, Face, mesh_chunk, transition_slab};
+use vx_voxel::{Chunk, ChunkKey, ChunkStore, Face, mesh_chunk_lod, transition_slab};
 use vx_worldgen::PlanetSampler;
 
 const USAGE: &str = "\
@@ -17,7 +17,8 @@ USAGE: vx_tools bench-chunk [--radius-km <km>] [--voxel-size <m>] [--seed <n>] [
 Generates and meshes surface chunks of the default planet on one thread and prints, per level
 (0, 3 and 6 unless --level picks one) and per height cache state (cold: the cache is cleared before
 each chunk; warm: the same chunk again), the median and p95 of generate (fill_chunk), the six
-transition slabs (transition_slab and fill_block, none at level 0), regular meshing (mesh_chunk)
+transition slabs (transition_slab and fill_block, none at level 0 and none on faces saturated at
+the distance clamp), meshing with transition cells (mesh_chunk_lod)
 and their total, against the 4 ms budget. Also times the classification of all air and all rock
 chunks and the compression of a surface chunk.";
 
@@ -203,14 +204,17 @@ fn measure(sampler: &PlanetSampler, config: &WorldConfig, key: ChunkKey, out: &m
     let t0 = Instant::now();
     sampler.fill_chunk(&mut chunk);
     let t1 = Instant::now();
-    for face in Face::ALL {
-        if let Some(mut slab) = transition_slab(key, face, config.voxel_size_m) {
-            sampler.fill_block(&mut slab);
-            std::hint::black_box(&slab);
+    // As the game does: faces whose samples all sit at the clamp get no slab (D26).
+    let slabs = Face::ALL.map(|face| {
+        if chunk.face_is_saturated(face) {
+            return None;
         }
-    }
+        let mut slab = transition_slab(key, face, config.voxel_size_m)?;
+        sampler.fill_block(&mut slab);
+        Some(slab)
+    });
     let t2 = Instant::now();
-    let mesh = mesh_chunk(&chunk);
+    let mesh = mesh_chunk_lod(&chunk, &slabs);
     let t3 = Instant::now();
     out.generate.push(ms(t1 - t0));
     out.slabs.push(ms(t2 - t1));

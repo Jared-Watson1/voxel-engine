@@ -177,6 +177,32 @@ impl Chunk {
         }
     }
 
+    /// True when every sample on `face`'s plane (apron rows included) sits at the distance clamp
+    /// with one sign. The next finer level's field differs from this level's by less than one
+    /// voxel of this level (the octaves a level drops have wavelengths under two node spacings,
+    /// so amplitudes under a voxel, D21), far less than the clamp of about four voxels, so the
+    /// finer surface cannot cross such a face and its transition slab would hold no geometry
+    /// (D22, D26). Skipping those slabs saves their height nodes, the dominant cost of a coarse
+    /// chunk, because the faces parallel to the ground cover the whole chunk area.
+    pub fn face_is_saturated(&self, face: crate::Face) -> bool {
+        let plane = if face.is_high() {
+            CHUNK_SIZE as isize
+        } else {
+            0
+        };
+        let at = |u: isize, v: isize| match face.axis() {
+            0 => self.get(plane, u, v),
+            1 => self.get(u, plane, v),
+            _ => self.get(u, v, plane),
+        };
+        let first = at(-1, -1).distance;
+        if first.unsigned_abs() < i8::MAX as u8 {
+            return false;
+        }
+        let last = CHUNK_SIZE as isize + 1;
+        (-1..=last).all(|v| (-1..=last).all(|u| at(u, v).distance == first))
+    }
+
     /// Sets every sample to `voxel`.
     pub fn fill_uniform(&mut self, voxel: Voxel) {
         self.voxels.fill(voxel);
@@ -312,5 +338,29 @@ mod tests {
         assert!(!chunk.has_surface());
         chunk.set(4, 4, 4, Voxel::AIR);
         assert!(chunk.has_surface());
+    }
+}
+
+#[cfg(test)]
+mod face_saturation_tests {
+    use super::*;
+    use crate::{ChunkKey, Face};
+
+    #[test]
+    fn only_faces_entirely_at_the_clamp_are_saturated() {
+        let mut chunk = Chunk::new(ChunkKey::new(0, 0, 0), 1.0);
+        // A plane at y = 10 m: the top face (y = 32) is far above, the bottom face (y = 0) far below.
+        chunk.fill_from(|p| p.y - 10.0);
+        assert!(chunk.face_is_saturated(Face::HighY));
+        assert!(chunk.face_is_saturated(Face::LowY));
+        assert!(
+            !chunk.face_is_saturated(Face::LowX),
+            "the surface crosses the side faces"
+        );
+        chunk.fill_from(|p| p.y - 1.5);
+        assert!(
+            !chunk.face_is_saturated(Face::LowY),
+            "within the band of the low face"
+        );
     }
 }
